@@ -10,7 +10,7 @@
 
   So it is two files. The first declares the module -- defaults, options, and
   nothing that can fail -- and this one holds every line of behaviour. The tab
-  now exists whatever happens here, and `/eqob doctor` says which half stopped.
+  now exists whatever happens here, and `/eq doctor` says which half stopped.
 
   It is also just a better shape. One file was carrying the decoration chain,
   the window styling, channel names, player names, item links, mentions, popups,
@@ -37,7 +37,7 @@ if not M then
     return
 end
 
---[[ The same breadcrumbs as the first half, so `/eqob doctor` can say which of
+--[[ The same breadcrumbs as the first half, so `/eq doctor` can say which of
      the two stopped and roughly where. See the note in `modules/chat.lua`. ]]--
 OB.chatLoad = 100
 
@@ -352,6 +352,12 @@ function M:Install()
                     text = OB.modules.chat:Decorate(index, text)
                 end
 
+                --[[ Recorded *after* decoration, so what comes back after a
+                     reload is the line as it was actually shown -- timestamp,
+                     class colours and all -- rather than the raw text with
+                     today's decoration reapplied to yesterday's message. ]]--
+                OB.modules.chat:RecordHistory(index, text, r, g, b, id)
+
                 return original(self2, text, r, g, b, id)
             end
         end
@@ -359,6 +365,261 @@ function M:Install()
 end
 
 -- ---------------------------------------------------------------------------
+
+
+-- ---------------------------------------------------------------------------
+-- the away reply, which arrives every time
+-- ---------------------------------------------------------------------------
+
+--[[ **Whisper somebody who is AFK and the server tells you so. Whisper them
+     again and it tells you again.**
+
+     The auto-reply arrives as `CHAT_MSG_AFK` or `CHAT_MSG_DND`, and the client
+     delivers one on *every* whisper. A conversation with somebody who forgot to
+     clear their AFK reads as your message, their away notice, your message,
+     their away notice -- with the actual conversation pushed off the top.
+
+     Swallowed at `ChatFrame_OnEvent`, which is where the client turns an event
+     into a line, rather than by unregistering the events from the frames. Two
+     reasons: unregistering is a change another addon can see and be surprised
+     by, and it cannot be undone per-message -- this can, so the switch works
+     both ways without a reload.
+
+     **The `<AFK>` marker beside their name is untouched.** It is drawn from
+     `CHAT_FLAG_AFK` on their own lines and has nothing to do with these two
+     events, so you still know they are away. You are simply not told again
+     every time you speak. ]]--
+local AWAY_EVENTS = {
+    CHAT_MSG_AFK = true,
+    CHAT_MSG_DND = true,
+}
+
+function M:InstallAwayFilter()
+    if EquadisOverhaulBlizzChatEvent then return false end
+    if type(ChatFrame_OnEvent) ~= "function" then return false end
+
+    EquadisOverhaulBlizzChatEvent = ChatFrame_OnEvent
+
+    --[[ Reached through the global namespace rather than the `OB` upvalue, for
+         the reason the unit frame hooks are: `core.lua` assigns a fresh
+         namespace on every load and this wrapper outlives it, so an upvalue
+         would leave it reading a profile nobody is editing any more. ]]--
+    --[[ Fixed arguments rather than `...`: the client calls this with the
+         event alone and the rest in `arg1`..`arg9`. See `ask` in the character
+         panel for why `unpack(arg)` is the wrong spelling under the harness. ]]--
+    ChatFrame_OnEvent = function(a1, a2, a3)
+        local incoming = event
+
+        if incoming and AWAY_EVENTS[incoming] then
+            local m = EquadisClassicOverhaul
+                    and EquadisClassicOverhaul.modules
+                    and EquadisClassicOverhaul.modules.chat
+
+            --[[ Guarded on the module being enabled as well as the setting,
+                 because the hook outlives the binding by design -- switching
+                 Chat off must hand the away replies back. ]]--
+            if m and EquadisClassicOverhaul.ModuleEnabled("chat")
+                    and m:Config().hideAwayReplies then
+                return
+            end
+        end
+
+        return EquadisOverhaulBlizzChatEvent(a1, a2, a3)
+    end
+
+    return true
+end
+-- ---------------------------------------------------------------------------
+-- what was said before the reload
+-- ---------------------------------------------------------------------------
+
+--[[ **1.12 empties every chat window on `/reload` and on logout.**
+
+     The conversation you were in the middle of is simply gone, and reload is
+     something you do constantly while configuring an addon. Prat replayed what
+     it had seen; the thing that made it work rather than merely exist was
+     drawing the replayed lines *darker*, so history is readable and can never be
+     mistaken for something that just arrived.
+
+     **The store is the saved table itself**, not a copy flushed at logout. That
+     is the same trick `config.lua` uses for profiles, and it removes the entire
+     class of bug where the copy and the original disagree -- there is no save
+     step to forget, and a client that closes without warning has already
+     written everything it had. ]]--
+function M:HistoryStore()
+    if type(EquadisClassicOverhaulDB) ~= "table" then return nil end
+
+    EquadisClassicOverhaulDB.chatLog = EquadisClassicOverhaulDB.chatLog or {}
+
+    --[[ Per character. A chat log is the most personal thing this addon keeps
+         and the least useful shared: your bank alt's guild chat is not the
+         conversation you were having on your main. ]]--
+    local key = OB.CharacterKey and OB.CharacterKey() or "Unknown"
+
+    EquadisClassicOverhaulDB.chatLog[key] = EquadisClassicOverhaulDB.chatLog[key] or {}
+    return EquadisClassicOverhaulDB.chatLog[key]
+end
+
+--[[ Keep one line. Called from the `AddMessage` hook for every window, so it is
+     on the path of every line of chat in the game and does as little as it can
+     get away with. ]]--
+function M:RecordHistory(index, text, r, g, b, id)
+    if not text or text == "" then return false end
+
+    --[[ **Never record a replay.** The replay writes through the same
+         `AddMessage` the capture hooks, so without this the log would eat its
+         own tail: every login would append yesterday's lines again, dimmed
+         again, and the file would grow without bound. ]]--
+    if self.replayingHistory then return false end
+
+    if not OB.ModuleEnabled("chat") then return false end
+    local cfg = self:Config()
+    if not cfg.history then return false end
+
+    local store = self:HistoryStore()
+    if not store then return false end
+
+    store[index] = store[index] or {}
+    local lines = store[index]
+
+    --[[ Colour is stored beside the text because `AddMessage` is given it
+         separately and it is not recoverable from the string: an uncoloured
+         line takes the window's default, and the window's default is not
+         necessarily what it was when the line arrived. ]]--
+    table.insert(lines, {
+        text = text,
+        r = r, g = g, b = b,
+        id = id,
+    })
+
+    --[[ Trimmed from the front as it grows rather than swept later, so the file
+         has a hard ceiling at all times instead of between sweeps. ]]--
+    local cap = tonumber(cfg.historyLines) or 100
+    if cap < 0 then cap = 0 end
+
+    while table.getn(lines) > cap do table.remove(lines, 1) end
+
+    return true
+end
+
+--[[ The colour a replayed line is drawn in: its own, scaled down.
+
+     Scaled rather than replaced, so a whisper stays pink and a party line stays
+     blue. You can still tell what kind of line it was; it is just visibly past.
+     A line that arrived with no colour of its own is given the window's default
+     white to scale, because scaling nothing would leave it at the window's
+     current colour and it would not read as history at all. ]]--
+function M:HistoryColor(r, g, b)
+    local dim = tonumber(self:Config().historyDim) or 0.55
+    if dim < 0 then dim = 0 end
+    if dim > 1 then dim = 1 end
+
+    return (tonumber(r) or 1) * dim,
+           (tonumber(g) or 1) * dim,
+           (tonumber(b) or 1) * dim
+end
+
+--[==[ **A coloured name ignores the colour a line is drawn in.**
+
+     `AddMessage` takes an r, g, b -- and an escape inside the text overrides it
+     for as long as it is open. Player names, item links and channel labels all
+     carry their own `|cAARRGGBB`, so dimming the line dimmed everything except
+     the parts that had been coloured on purpose: history came back grey with
+     full-brightness names sitting in it, which reads as the names being the
+     live part of an old line.
+
+     So the escapes are scaled by the same amount. The alpha is left alone --
+     it is not brightness, and an item link that faded out would stop looking
+     like a link.
+
+     Done to a copy at replay time rather than to what is stored. Dimming the
+     stored copy would compound: each session would replay yesterday's already
+     dimmed text and dim it again, until history was black. ]==]
+function M:DimEmbeddedColors(text, dim)
+    if type(text) ~= "string" then return text end
+    if not string.find(text, "|c", 1, true) then return text end
+
+    local scaled = string.gsub(text, "|c(%x%x)(%x%x)(%x%x)(%x%x)",
+        function(alpha, r, g, b)
+            local function channel(hex)
+                local value = tonumber(hex, 16) or 255
+                value = math.floor(value * dim)
+
+                --[[ Clamped both ways. A dim above one is a setting somebody
+                     has edited by hand, and a channel over 255 wraps rather
+                     than saturating -- which turns a bright name black. ]]--
+                if value < 0 then value = 0 end
+                if value > 255 then value = 255 end
+
+                return string.format("%02x", value)
+            end
+
+            return "|c" .. alpha .. channel(r) .. channel(g) .. channel(b)
+        end)
+
+    return scaled
+end
+
+--[[ **Write the kept lines back into the windows.**
+
+     Through the frame's *original* `AddMessage` rather than the hooked one, for
+     the same reason `Record` refuses to run during a replay: going through the
+     hook would re-decorate lines that are already decorated, stamping today's
+     time onto yesterday's message. The flag is belt and braces for anything
+     else that has wrapped the frame since.
+
+     Once per session. A second call would double every line. ]]--
+function M:ReplayHistory()
+    if self.historyReplayed then return false end
+    if not OB.ModuleEnabled("chat") then return false end
+    if not self:Config().history then return false end
+
+    local store = self:HistoryStore()
+    if not store then return false end
+
+    self.historyReplayed = true
+    self.replayingHistory = true
+
+    for i = 1, WINDOWS do
+        local lines = store[i]
+        local frame = getglobal("ChatFrame" .. i)
+
+        if frame and lines then
+            local write = (self.hooked and self.hooked[i]) or frame.AddMessage
+
+            for j = 1, table.getn(lines) do
+                local line = lines[j]
+                if line and line.text then
+                    local r, g, b = self:HistoryColor(line.r, line.g, line.b)
+
+                    --[[ The line's colour and the colours written into it, by
+                         the same amount, or the names stay bright inside a dim
+                         line. ]]--
+                    local dim = tonumber(self:Config().historyDim) or 0.55
+                    local text = self:DimEmbeddedColors(line.text, dim)
+
+                    write(frame, text, r, g, b, line.id)
+                end
+            end
+        end
+    end
+
+    self.replayingHistory = nil
+    return true
+end
+
+--[[ Throw the kept lines away, for the switch on the page and for anybody who
+     wants the file to stop holding a copy of their conversations. Clears what
+     is on disk, not what is on screen -- the window keeps what it is showing
+     until the client next empties it, which is what somebody clicking this
+     would expect. ]]--
+function M:ForgetHistory()
+    local store = self:HistoryStore()
+    if not store then return false end
+
+    for i = 1, WINDOWS do store[i] = nil end
+    return true
+end
 -- window appearance
 -- ---------------------------------------------------------------------------
 -- what you said last
@@ -400,40 +661,7 @@ function M:Remember(message)
         box:AddHistoryLine(message)
     end
 
-    --[[ Kept for the small history helpers/tests below. The live EditBox now
-         maintains its own current history position. ]]--
-    self.historyAt = nil
-
     return true
-end
-
---[[ One step through it. `up` is towards older.
-
-     **Returns nil at the newest end rather than wrapping**, because wrapping
-     from the newest to the oldest is a keypress that looks like a bug -- and
-     because the empty box below the newest line is a real position: it is what
-     you had before you started paging. ]]--
-function M:HistoryStep(up)
-    local lines = self.history or {}
-    local count = table.getn(lines)
-
-    if count == 0 then return nil end
-
-    local at = self.historyAt or (count + 1)
-
-    if up then
-        at = at - 1
-        if at < 1 then at = 1 end
-    else
-        at = at + 1
-        if at > count + 1 then at = count + 1 end
-    end
-
-    self.historyAt = at
-
-    if at > count then return "" end
-
-    return lines[at]
 end
 
 --[[ **Paging starts from the newest again once the box has been closed.**
@@ -929,7 +1157,7 @@ function M:ApplyWindows()
                      to the profile's font, so leaving the row alone leaves chat
                      agreeing with everything else. ]]--
                 local flags
-                if cfg.fontOutline then flags = "OUTLINE" end
+                flags = OB.FontFlags(cfg.fontOutline)
                 frame:SetFont(OB.FontPath("chat"), cfg.fontSize, flags)
                 frame:SetJustifyH(OB.chatJustify[cfg.justify] or "LEFT")
 
@@ -1111,7 +1339,9 @@ end
 function M:Wheel(index, direction)
     local cfg = self:Config()
 
-    if not (cfg.wheel and OB.ModuleEnabled("chat")) then
+    --[[ The subsystem switch still applies; the per-feature one has gone.
+         See the note where its row used to be. ]]--
+    if not OB.ModuleEnabled("chat") then
         local original = self.originalWheel and self.originalWheel[index]
         if original then original() end
         return
@@ -1153,6 +1383,108 @@ end
      the setting says something else, and the change goes through. On every pass
      after that it already holds the answer and nothing happens. One comparison,
      both bugs. ]]--
+--[[ **The way back down, which 1.12 does not offer.**
+
+     Scroll up to read something and the only ways back are the wheel, the arrow
+     under it, or waiting for a new message to arrive. Every chat client written
+     since has a jump-to-newest button and it is the first thing people miss.
+
+     Shown only while there *is* something below to go back to: a button that is
+     always there is a button that means nothing when it appears, and this one
+     sits over the chat window where anything permanent would be in the way. ]]--
+local JUMP_CHECK_INTERVAL = 0.1
+
+function M:JumpButton(index)
+    local frame = getglobal("ChatFrame" .. index)
+    if not frame then return nil end
+
+    self.jumpButtons = self.jumpButtons or {}
+    if self.jumpButtons[index] then return self.jumpButtons[index] end
+
+    local button = CreateFrame("Button", "EquadisOverhaulChatJump" .. index, frame)
+    button:SetWidth(24)
+    button:SetHeight(24)
+
+    --[[ Bottom right of the window, clear of the edit box under it and of the
+         client's own scroll arrows on the right. ]]--
+    button:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 4, -4)
+
+    --[[ The client's own scroll-down art, so it reads as part of the chat frame
+         rather than as something bolted to it. ]]--
+    button:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Up")
+    button:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Down")
+    button:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight")
+
+    button.chatFrame = frame
+    button:Hide()
+
+    button:SetScript("OnClick", function()
+        local target = this.chatFrame
+        if target and target.ScrollToBottom then target:ScrollToBottom() end
+        this:Hide()
+    end)
+
+    --[[ Throttled. `AtBottom` is cheap, but this runs for every open window and
+         there is no reason to ask sixty times a second whether somebody has
+         scrolled -- a tenth of a second is faster than anybody can notice and a
+         sixth of the work. ]]--
+    button:SetScript("OnUpdate", function()
+        local m = EquadisClassicOverhaul.modules.chat
+        if not m then return end
+
+        this.nextCheck = (this.nextCheck or 0) - (arg1 or 0)
+        if this.nextCheck > 0 then return end
+        this.nextCheck = JUMP_CHECK_INTERVAL
+
+        m:UpdateJumpButton(this)
+    end)
+
+    self.jumpButtons[index] = button
+    return button
+end
+
+--[[ Whether one button should be on screen: only while its window is, only
+     while the setting is on, and only while there is something below. ]]--
+function M:UpdateJumpButton(button)
+    if not button then return false end
+
+    local frame = button.chatFrame
+
+    if not self:Config().jumpButton
+            or not frame
+            or not frame.IsShown or not frame:IsShown()
+            or not frame.AtBottom or frame:AtBottom() then
+        button:Hide()
+        return false
+    end
+
+    button:Show()
+    return true
+end
+
+function M:ApplyJumpButtons()
+    local cfg = self:Config()
+
+    for i = 1, WINDOWS do
+        local button = self:JumpButton(i)
+
+        if button then
+            --[[ Switched off means no work at all, not a hidden button still
+                 asking every tenth of a second whether it should be. ]]--
+            if cfg.jumpButton then
+                button:SetScript("OnUpdate", button.checkScript or button:GetScript("OnUpdate"))
+                self:UpdateJumpButton(button)
+            else
+                button.checkScript = button.checkScript or button:GetScript("OnUpdate")
+                button:SetScript("OnUpdate", nil)
+                button:Hide()
+            end
+        end
+    end
+
+    return true
+end
+
 function M:ApplyScrollback()
     local cfg = self:Config()
 
@@ -1320,7 +1652,7 @@ function M:LinkUrl(url)
 end
 
 function M:DecorateUrls(text)
-    if not self:Config().urlCopy then return text end
+    --[[ No switch: see the note where the row used to be. ]]--
     if not text then return text end
 
     --[[ A leading space is added so a URL at the very start of a line is still
@@ -1386,7 +1718,6 @@ end
      this removes. ]]--
 function M:RememberColor(channel, r, g, b)
     if not channel or not r then return end
-    if not self:Config().rememberColors then return end
 
     local base = channelBase(channel)
     if not base then return end
@@ -1395,7 +1726,6 @@ function M:RememberColor(channel, r, g, b)
 end
 
 function M:ApplyRememberedColor(channel)
-    if not self:Config().rememberColors then return false end
     if type(ChangeChatColor) ~= "function" then return false end
 
     local base = channelBase(channel)
@@ -1695,7 +2025,7 @@ end
 
 --[[ **What each chat window actually holds**, printed.
 
-     Written for the same reason `/eqob windows` was: two rounds of reading the
+     Written for the same reason `/eq windows` was: two rounds of reading the
      code did not find why chat settings come back changed after a reload, and a
      third would not either. What settles it is one line of output per window --
      the channels it is showing and the message groups it is registered for,
@@ -1748,7 +2078,7 @@ function M:PrintReport()
     end
 
     Say(remembered .. " remembered removal(s). "
-            .. "'/eqob chat forget' clears them.")
+            .. "'/eq chat forget' clears them.")
 end
 
 
@@ -1769,6 +2099,13 @@ function M:OnEvent()
     if event == "PLAYER_ENTERING_WORLD" then
         self.chatReady = true
         self:ApplyChannelMemory()
+
+        --[[ Replayed here rather than at bind, because the client restores its
+             own windows as the world comes in and anything written before that
+             is written into a frame it is about to rebuild. This fires again on
+             every loading screen; `ReplayHistory` is once per session and says
+             so itself. ]]--
+        self:ReplayHistory()
         return
     end
 
@@ -1798,21 +2135,175 @@ function M:OnEvent()
 
 end
 
+
+-- ---------------------------------------------------------------------------
+-- giving the client its chat back
+-- ---------------------------------------------------------------------------
+
+--[[ **This module had no way to stop.**
+
+     Every other subsystem that rearranges Blizzard's widgets carries a restore:
+     the unit frames put the frames back, the action bars re-parent the buttons,
+     the buff frames hand the auras over. This one had neither an `OnUnbind` nor
+     anything to call from one -- so switching Chat off, or resetting the
+     profile, which disables it, left every change it had made exactly where it
+     was. The fonts, the sizes, the hidden scroll arrows, the moved edit box.
+
+     Reported as chat settings surviving a reset, and it was worse than that:
+     switching the module off did nothing visible at all, which is the same bug
+     seen from the other end.
+
+     **Captured once at the first bind**, before anything has been applied. A
+     second capture would record this module's own arrangement as the original
+     and restore to that, which is not a restore -- the same rule the action
+     bars learned. ]]--
+function M:CaptureChat()
+    if self.originalChat then return false end
+
+    local saved = {}
+
+    for i = 1, WINDOWS do
+        local frame = getglobal("ChatFrame" .. i)
+        local entry = {}
+
+        if frame then
+            if frame.GetFont then
+                entry.font, entry.fontSize, entry.fontFlags = frame:GetFont()
+            end
+
+            --[[ How far back the window remembers. Changed by `ApplyScrollback`
+                 and invisible until somebody scrolls, which is exactly the kind
+                 of setting that would otherwise never be handed back. ]]--
+            if frame.GetMaxLines then entry.maxLines = frame:GetMaxLines() end
+        end
+
+        --[[ The furniture round each window: the scroll arrows this module can
+             hide. Recorded shown-or-not rather than forced back to shown, since
+             a client that had them hidden for its own reasons should keep
+             them. ]]--
+        entry.buttons = {}
+        for b = 1, table.getn(FRAME_BUTTONS) do
+            local button = getglobal("ChatFrame" .. i .. FRAME_BUTTONS[b])
+            if button and button.IsShown then
+                entry.buttons[b] = button:IsShown() and true or false
+            end
+        end
+
+        saved[i] = entry
+    end
+
+    if ChatFrameMenuButton and ChatFrameMenuButton.IsShown then
+        saved.menuButton = ChatFrameMenuButton:IsShown() and true or false
+    end
+
+    self.originalChat = saved
+    return true
+end
+
+--[[ Put back what was captured, and take away what this module added.
+
+     Two halves, and they are different in kind: the client's own widgets are
+     *restored* to what they were, and the frames this module built are simply
+     hidden -- there is nothing of Blizzard's under them to return to. ]]--
+function M:RestoreChat()
+    local saved = self.originalChat
+
+    if saved then
+        for i = 1, WINDOWS do
+            local frame = getglobal("ChatFrame" .. i)
+            local entry = saved[i]
+
+            if frame and entry then
+                if entry.font and frame.SetFont then
+                    frame:SetFont(entry.font, entry.fontSize, entry.fontFlags)
+                end
+
+                if entry.maxLines and frame.SetMaxLines then
+                    frame:SetMaxLines(entry.maxLines)
+                end
+            end
+
+            if entry and entry.buttons then
+                for b = 1, table.getn(FRAME_BUTTONS) do
+                    local button = getglobal("ChatFrame" .. i .. FRAME_BUTTONS[b])
+                    local was = entry.buttons[b]
+
+                    if button and was ~= nil then
+                        if was then button:Show() else button:Hide() end
+                    end
+                end
+            end
+        end
+
+        if ChatFrameMenuButton and saved.menuButton ~= nil then
+            if saved.menuButton then
+                ChatFrameMenuButton:Show()
+            else
+                ChatFrameMenuButton:Hide()
+            end
+        end
+    end
+
+    --[[ **The frames this module made go away rather than back.** A jump button
+         or a search box is not something the client had a version of, so there
+         is nothing to restore them to -- hidden is the whole of "not here any
+         more". ]]--
+    if self.jumpButtons then
+        for i = 1, WINDOWS do
+            local button = self.jumpButtons[i]
+            if button and button.Hide then button:Hide() end
+        end
+    end
+
+    if self.boxes then
+        for i = 1, WINDOWS do
+            local box = self.boxes[i]
+            if box and box.Hide then box:Hide() end
+        end
+    end
+
+    if self.popups then
+        for i, popup in pairs(self.popups) do
+            if popup and popup.Hide then popup:Hide() end
+        end
+    end
+
+    --[[ The edit box is the client's and this module moves it, so it is put
+         back rather than hidden -- hiding it would take away the only way to
+         type. ]]--
+    if self.ResetEditBox then pcall(self.ResetEditBox, self) end
+
+    return true
+end
 function M:OnBind()
     self.lastMinute = nil
     self.drift = nil
 
+    --[[ Before anything is applied, so what is captured is the client's own
+         arrangement rather than this module's. ]]--
+    self:CaptureChat()
+
     self:Install()
+    self:InstallAwayFilter()
     self:InstallWheel()
     self:InstallChannelMemory()
     self:InstallUrlClicks()
     self:ApplyWindows()
     self:ApplyScrollback()
+    self:ApplyJumpButtons()
     self:ApplyChannels()
     self:ApplyNames()
     self:ApplySearchBoxes()
     self:ApplyPopups()
     self:ApplyEditBox()
+end
+
+--[[ **Hand the chat back.** Every other subsystem that rearranges Blizzard's
+     widgets has one of these; this module had none, so switching it off -- or
+     resetting the profile, which disables it -- left every change it had made
+     exactly where it was. ]]--
+function M:OnUnbind()
+    self:RestoreChat()
 end
 
 --[[ Re-applied whenever a setting changes, which is what makes the section's
@@ -1822,6 +2313,7 @@ function M:OnStyle()
     self:ApplyWindows()
     self:ApplyEditBox()
     self:ApplyScrollback()
+    self:ApplyJumpButtons()
     self:ApplySticky()
     self:ApplyButtons()
     self:ApplyChannels()
@@ -1965,6 +2457,46 @@ function M:ChannelNeedsEncoding(channel)
          behaviours needed it, which is why it lives at the top of this file. ]]--
     return not BUILTIN[channelBase(name) or ""]
 end
+--[[ **Macro directives are not things you said.**
+
+     1.12 has no `#showtooltip`. The client's macro runner treats any line that
+     is not a slash command as something to say, so a macro carrying that line
+     announces it to whatever channel you are in every time you press the
+     button. It is not merely showing up in the log -- it is being broadcast,
+     and the log is just where you noticed.
+
+     Addons that implement the directive normally strip it before execution.
+     When one of them misses a path -- an inner macro, a button pressed through
+     a hook it does not own -- the raw line goes out.
+
+     **Matched narrowly, on `#show` and its family**, not on `#` generally.
+     People do type messages beginning with a hash: "#1 on the list" is a
+     sentence and dropping it would be a worse bug than the one being fixed. ]]--
+local MACRO_DIRECTIVES = {
+    "^#showtooltip",
+    "^#showicon",
+    "^#show",
+}
+
+function M:IsMacroDirective(msg)
+    if not msg then return false end
+    if not self:Config().hideMacroDirectives then return false end
+
+    --[[ Lowercased for the comparison only. Whatever is sent, if it is sent, is
+         what the caller passed. ]]--
+    local text = string.lower(msg)
+
+    --[[ Leading space stripped, because a macro line may carry one and the
+         client's own runner does not care. ]]--
+    text = string.gsub(text, "^%s+", "")
+
+    for i = 1, table.getn(MACRO_DIRECTIVES) do
+        if string.find(text, MACRO_DIRECTIVES[i]) then return true end
+    end
+
+    return false
+end
+
 
 --[[ **Installed once, never removed**, on the rule the rest of this addon
      follows: a global function slot is one deep, so restoring our saved original
@@ -1977,6 +2509,13 @@ function M:InstallLinks()
 
     SendChatMessage = function(msg, chatType, language, channel)
         local m = EquadisClassicOverhaul.modules.chat
+
+        --[[ Dropped before it is remembered, or paging back through what you
+             said would hand you a macro directive to say again. ]]--
+        if EquadisClassicOverhaul.ModuleEnabled("chat")
+                and m:IsMacroDirective(msg) then
+            return
+        end
 
         --[[ Remembered before it is encoded, so paging back gives you the line
              you typed rather than the wire form of it. ]]--
@@ -2260,7 +2799,7 @@ end
      command does. ]]--
 function M:Find(needle, index)
     if not needle or needle == "" then
-        Say("usage: /eqob chat find <text>.")
+        Say("usage: /eq chat find <text>.")
         return 0
     end
 
@@ -2307,16 +2846,6 @@ function M:Find(needle, index)
     self.printing = nil
 
     return found
-end
-
-function M:Remembered()
-    local n = 0
-
-    for i = 1, WINDOWS do
-        n = n + table.getn((self.log and self.log[i]) or {})
-    end
-
-    return n
 end
 
 --[[ **A box on the window itself**, which is what a search wants: the question
@@ -2472,13 +3001,38 @@ end
      mention past the cap takes the oldest slot rather than growing the pile. ]]--
 local POPUPS = 4
 
+--[[ **Which box a line belongs in**, which is a shorter list than the colour
+     fallback above and deliberately so.
+
+     A leader talking is the same room as anybody else in it, so those two
+     collapse. Everything else stays apart even where it shares a colour:
+     officer chat is not guild chat, a raid warning is not raid chat, and an
+     emote is not a say. Grouping them would put two rooms in one box under one
+     heading and lose which was which, and the whole point of a box per channel
+     is that you can tell at a glance who is talking to you. ]]--
+local POPUP_GROUP = {
+    PARTY_LEADER = "PARTY",
+    RAID_LEADER = "RAID",
+}
+
+--[[ How many lines one box keeps before the oldest falls off the top. A busy
+     channel must not be able to grow a box until it covers the screen. ]]--
+local POPUP_MAX_LINES = 5
+
+-- The box width, shared by the frame and by the wrap width of the text in it.
+local POPUP_WIDTH = 420
+
+-- Room for the text, plus the backdrop's own inset at each end.
+local POPUP_LINE_PAD = 3
+local POPUP_BOX_PAD = 14
+
 function M:PopupFrame(slot)
     self.popups = self.popups or {}
     if self.popups[slot] then return self.popups[slot] end
 
     local frame = CreateFrame("Frame", "EquadisOverhaulPopup" .. slot, UIParent)
 
-    frame:SetWidth(420)
+    frame:SetWidth(POPUP_WIDTH)
     frame:SetHeight(44)
     frame:SetFrameStrata("DIALOG")
     frame:SetClampedToScreen(true)
@@ -2496,8 +3050,21 @@ function M:PopupFrame(slot)
     local text = OB.NewText(frame, "OVERLAY", "GameFontNormal")
     local font, _, flags = text:GetFont()
     if font then text:SetFont(font, self:Config().popupTextSize or 12, flags) end
+
+    --[[ **Anchored at the top only, with an explicit width.**
+
+         It was pinned top *and* bottom, which makes the frame's height the
+         text's height -- so a message too long for one line had nowhere to wrap
+         into and the client cut it off with an ellipsis. A second message then
+         arrived on its own line and looked right, which made it read as a
+         truncation rule rather than as a box one line too short.
+
+         One anchor and a width is the other way round: the width decides where
+         it wraps, the text grows downwards as far as it needs, and `SizePopup`
+         reads that back to size the box. The text defines the box now, rather
+         than the box clipping the text. ]]--
     text:SetPoint("TOPLEFT", frame, "TOPLEFT", 8, -6)
-    text:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8, 6)
+    text:SetWidth(POPUP_WIDTH - 16)
     text:SetJustifyH("LEFT")
     text:SetJustifyV("TOP")
 
@@ -2520,20 +3087,76 @@ end
      Reusing the oldest rather than refusing the new one, because the newest
      mention is the one somebody has not read yet -- dropping it to protect a
      line that has been on screen for nine seconds is the wrong way round. ]]--
-function M:PopupSlot()
-    local oldest, oldestLeft = 1, nil
+--[[ **The box this room already has, or a new one for it.**
+
+     A box per message meant four mentions filled the screen and the fifth threw
+     one away -- and the four could easily be the same conversation, which is the
+     case where the pile says least. A box per *room* holds as many lines as the
+     room has said, so party chatter is one box getting longer rather than four
+     boxes competing with the whisper you actually want to see.
+
+     Reusing the room's own box also makes the timer mean the right thing: a box
+     is up for as long as the conversation in it is live, not for as long as its
+     first line has been. See `Popup`. ]]--
+function M:PopupSlot(key)
+    local oldest, oldestAt = 1, nil
+
+    for i = 1, POPUPS do
+        local frame = self.popups and self.popups[i]
+
+        if frame and frame:IsShown() and key and frame.channelKey == key then
+            return i
+        end
+    end
 
     for i = 1, POPUPS do
         local frame = self.popups and self.popups[i]
 
         if not frame or not frame:IsShown() then return i end
 
-        if not oldestLeft or (frame.left or 0) < oldestLeft then
-            oldest, oldestLeft = i, frame.left or 0
+        --[[ Every box taken by a different room. The one that has gone longest
+             without a word is the one nobody is reading. ]]--
+        if not oldestAt or (frame.updated or 0) < oldestAt then
+            oldest, oldestAt = i, frame.updated or 0
         end
     end
 
     return oldest
+end
+
+--[[ A box is as tall as the conversation in it. Measured from the line count
+     and the chosen text size rather than from the font string, because the
+     client has not laid the text out yet at the moment this runs. ]]--
+--[[ **Measured after the text is in, not counted from the messages.**
+
+     This multiplied the *message* count by one line's height, so a message too
+     long for the width had nowhere to wrap into and the client cut it off with
+     an ellipsis. A second message then arrived on its own line and looked
+     correct, which made it read as a truncation rule rather than as a box that
+     was one line too short.
+
+     `GetStringHeight` answers what the font string actually needs once it has
+     wrapped, so a long line makes the box taller instead of losing its end.
+     Falling back to the old arithmetic where the client cannot answer -- an
+     un-laid-out font string returns zero, and a zero-height box is worse than a
+     slightly wrong one. ]]--
+function M:SizePopup(frame)
+    if not frame then return false end
+
+    local size = self:Config().popupTextSize or 12
+    local lines = frame.lines and table.getn(frame.lines) or 1
+    if lines < 1 then lines = 1 end
+
+    local needed = 0
+    if frame.text and frame.text.GetStringHeight then
+        needed = frame.text:GetStringHeight() or 0
+    end
+
+    local counted = lines * (size + POPUP_LINE_PAD)
+    if needed < counted then needed = counted end
+
+    frame:SetHeight(needed + POPUP_BOX_PAD)
+    return true
 end
 
 --[[ One tick of one popup's fade. Held at full while the mover is on, or placing
@@ -2573,19 +3196,60 @@ function M:StackPopups()
     local y = cfg.popupPos.y or 120
     local shown = 0
 
+    --[[ **Newest at the top, older pushed down under it.**
+
+         The stack used to be in slot order, which is the order the boxes were
+         first filled -- so the newest thing arrived at the *bottom*, under
+         however much was already there, which is the one place somebody
+         glancing across is least likely to look.
+
+         Ordered by when each box last heard something, so a room that speaks
+         again comes back to the top. That is the same fact its timer already
+         records: a box is ranked and kept alive by the same event. ]]--
+    local order = {}
+
     for i = 1, POPUPS do
         local frame = self.popups and self.popups[i]
+        if frame and frame:IsShown() then table.insert(order, frame) end
+    end
 
-        if frame and frame:IsShown() then
-            frame:ClearAllPoints()
-            frame:SetPoint("CENTER", UIParent, "CENTER", cfg.popupPos.x or 0, y)
-
-            --[[ Its own height, so the gap is right at any scale -- and the
-                 stack grows downwards, because the anchor is where the first one
-                 goes and everybody knows where that is. ]]--
-            y = y - (frame:GetHeight() + 4)
-            shown = shown + 1
+    table.sort(order, function(a, b)
+        --[[ Ties broken by slot so the sort is total. Two boxes updated in the
+             same frame would otherwise be free to swap places on every restack,
+             which reads as the pile twitching. ]]--
+        if (a.updated or 0) == (b.updated or 0) then
+            return (a.slot or 0) < (b.slot or 0)
         end
+        return (a.updated or 0) > (b.updated or 0)
+    end)
+
+    --[==[ **Stacked by top edges, not by centres.**
+
+         Each box used to be placed by its CENTER while the step below it was
+         taken from its full height. Those two agree only while every box is the
+         same height, and they are not: a box is sized to the lines it holds, so
+         a raid warning that wraps to two lines is taller than the whisper above
+         it. Centre anchoring spends half of that extra height going *upwards*,
+         into the box already there -- which is the reported overlap, and why it
+         only ever showed up on the long messages.
+
+         Top edges make it exact at any mix of heights, because each box now
+         begins a fixed gap below where the last one actually ended rather than
+         below where a box of average height would have. ]==]
+    for i = 1, table.getn(order) do
+        local frame = order[i]
+
+        --[[ The first box still sits exactly where it did -- centred on the
+             stored position, which is also what StorePopup writes -- so this
+             does not shift a stack somebody has already placed. Only the boxes
+             underneath it move, and only off each other. ]]--
+        if i == 1 then y = y + (frame:GetHeight() / 2) end
+
+        frame:ClearAllPoints()
+        frame:SetPoint("TOP", UIParent, "CENTER", cfg.popupPos.x or 0, y)
+
+        y = y - (frame:GetHeight() + 4)
+        shown = shown + 1
     end
 
     return shown
@@ -2723,13 +3387,133 @@ function M:ShouldPopup(index, text)
 end
 
 
+--[[ Paint one popup in its channel's colour.
+
+     **Only the runs the line does not colour itself.** `SetTextColor` is the
+     colour of any text that carries no escape code of its own, so a name the
+     highlighting pass has already wrapped in `|cff...` keeps that colour and
+     everything around it becomes the channel's. That is the right way round: the
+     popup reads as a line out of the chat window, which is what it is a copy
+     of. ]]--
+function M:ColorPopup(frame)
+    if not frame or not frame.text or not frame.text.SetTextColor then return false end
+
+    local c = frame.channelColor
+    if not c then
+        frame.text:SetTextColor(1, 1, 1)
+        return false
+    end
+
+    frame.text:SetTextColor(c[1], c[2], c[3])
+    return true
+end
+
+--[[ A leader or a warning is the same room, and 1.12 does not always have a
+     colour of its own for it. Falls back to the channel it belongs to rather
+     than to white, which would be the one case that looked like a bug. ]]--
+local POPUP_COLOR_FALLBACK = {
+    PARTY_LEADER = "PARTY",
+    RAID_LEADER = "RAID",
+    RAID_WARNING = "RAID",
+    EMOTE = "SAY",
+    OFFICER = "GUILD",
+}
+
+
+--[[ **What colour this line is in the chat window, taken from the client.**
+
+     `ChatTypeInfo` is the client's own table and it holds whatever the reader
+     set in Chat Colors -- so a whisper is the pink *they* chose, not a pink this
+     addon picked and would then be wrong about forever. Copying the value is the
+     whole of it; there is no palette here to keep in step with theirs.
+
+     A numbered channel is answered by its number, the same way
+     `PopupChannelWanted` answers it: General and Trade are two rooms with two
+     colours, and `ChatTypeInfo.CHANNEL` is neither of them. ]]--
+--[[ **Which room this line came from**, as one stable string.
+
+     The box a mention lands in, the colour it is drawn in and the identity two
+     messages have to share to be grouped are all the same question, so they are
+     all answered here rather than derived separately and left to disagree.
+
+     A numbered channel is answered by its number, the same way
+     `PopupChannelWanted` answers it: General and Trade are two rooms that happen
+     to share a naming scheme. ]]--
+function M:PopupKey()
+    local event = self.lastEvent or ""
+
+    if event == "CHAT_MSG_CHANNEL" then
+        local n = tonumber(self.lastChannel)
+        if n then return "CHANNEL" .. n end
+        return "CHANNEL"
+    end
+
+    --[[ `CHAT_MSG_WHISPER` is `WHISPER`, and every other event this module pops
+         for follows the same rule -- so the name is derived rather than kept in
+         a second table that could disagree with `POPUP_FOR`. ]]--
+    local _, _, kind = string.find(event, "^CHAT_MSG_(.+)$")
+    if not kind then return nil end
+
+    return POPUP_GROUP[kind] or kind
+end
+
+function M:PopupColor(key)
+    if type(ChatTypeInfo) ~= "table" then return nil end
+    if not key then return nil end
+
+    local info = ChatTypeInfo[key]
+
+    --[[ A numbered channel with no colour of its own falls back to the generic
+         one rather than to white. ]]--
+    if not info and string.find(key, "^CHANNEL%d") then
+        info = ChatTypeInfo["CHANNEL"]
+    end
+
+    if not info and POPUP_COLOR_FALLBACK[key] then
+        info = ChatTypeInfo[POPUP_COLOR_FALLBACK[key]]
+    end
+
+    return info
+end
+
 function M:Popup(text)
     local cfg = self:Config()
-    local frame = self:PopupFrame(self:PopupSlot())
+
+    local key = self:PopupKey()
+    local frame = self:PopupFrame(self:PopupSlot(key))
+
+    --[[ A box that was showing this room's lines keeps them and adds to the
+         bottom. Anything else -- a free box, or one taken from a room that has
+         gone quiet -- starts again. ]]--
+    if not frame:IsShown() or frame.channelKey ~= key then
+        frame.lines = {}
+    end
+
+    frame.channelKey = key
+    frame.lines = frame.lines or {}
+    table.insert(frame.lines, text)
+
+    while table.getn(frame.lines) > POPUP_MAX_LINES do
+        table.remove(frame.lines, 1)
+    end
 
     frame:SetScale(cfg.popupScale)
-    frame.text:SetText(text)
+    frame.text:SetText(table.concat(frame.lines, "\n"))
+    self:SizePopup(frame)
+
+    --[[ **Read now and kept on the frame**, because `lastEvent` is about the
+         line being handled and this box outlives it. A later settings pass
+         re-styles every popup on screen, and asking again then would paint
+         whichever channel happened to speak most recently onto all of them. ]]--
+    local info = self:PopupColor(key)
+    frame.channelColor = info and { info.r or 1, info.g or 1, info.b or 1 } or nil
+    self:ColorPopup(frame)
+
+    --[[ **The timer is the conversation's, not the line's.** Every new message
+         in this room puts the box back to a full count, so a box stays up while
+         people are still talking and goes when they stop. ]]--
     frame.left = cfg.popupSeconds
+    frame.updated = GetTime()
     frame:SetAlpha(1)
     frame:Show()
 
@@ -2764,6 +3548,19 @@ function M:ApplyPopups()
                 local font, _, flags = frame.text:GetFont()
                 if font then frame.text:SetFont(font, cfg.popupTextSize or 12, flags) end
             end
+
+            --[[ The box is sized from the text size and the line count, so a
+                 change to either has to re-measure it. Without this, raising the
+                 text size wrote larger lines into a box still cut for the
+                 smaller ones. ]]--
+            self:SizePopup(frame)
+
+            --[[ `SetFont` resets the colour on some 1.12 builds, and this pass
+                 runs every time any setting on the page moves -- so the channel
+                 colour is re-asserted from what the frame remembers rather than
+                 left to survive. Nothing is re-read from `lastEvent`: see the
+                 note in `Popup`. ]]--
+            self:ColorPopup(frame)
         end
     end
 
@@ -2812,7 +3609,17 @@ function M:SetPopupMoving(on)
         EquadisClassicOverhaul.modules.chat:StorePopup()
     end)
 
-    frame.text:SetText("Somebody: this is where a mention will appear.")
+    --[[ Two lines, because a box holds a conversation rather than a message and
+         placing it against a single line would under-size the thing being
+         placed. Kept in `lines` so the sample measures the same way a real box
+         does. ]]--
+    frame.channelKey = nil
+    frame.lines = { "Somebody: this is where a mention will appear.",
+                    "Somebody: and the rest of what they said." }
+    frame.text:SetText(table.concat(frame.lines, "\n"))
+    self:SizePopup(frame)
+
+    frame.updated = GetTime()
     frame:SetAlpha(1)
     frame:Show()
 

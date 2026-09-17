@@ -453,13 +453,29 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Bundled Atlas-CFM-DestinationClick
-----------------------------------
-Source: https://github.com/eqomdx/Atlas-CFM-DestinationClick
-Bundled commit: 9d92e187cb327290feccf55542d5d3e05215a2e2
+Bundled Atlas-CFM
+-----------------
+Source: https://github.com/byCFM2/Atlas-CFM (upstream), bundled from the
+Atlas-CFM 1.70 "Personal / DBC-audited / cache filter fix" build supplied by the
+OctoWoW author. Replaces the 1.60 bundle (Atlas-CFM-DestinationClick commit
+9d92e187cb327290feccf55542d5d3e05215a2e2) on 2026-09-05.
 License: GNU GPL v2 or later. See third_party/Atlas-CFM/LICENSE.
-The bundled path constant is adjusted for EquadisClassicOverhaul and its own
-GameTooltip decorator is not loaded; ECO owns tooltip presentation.
+
+ECO's changes to it, all of them mechanical:
+  * CFMAtlas/AtlasConfig.lua  - PATH and MAPPATH point at ECO's folder.
+  * CFMAtlas/Atlas.lua        - the version comes from ECO's X-AtlasCFM-Version,
+                                and ECO's own ADDON_LOADED counts as Atlas'.
+  * CFMAtlas/AtlaspfUI.lua    - the same, for the pfUI bridge.
+  * CFMAtlas/AtlasHewdrop.lua - ECO's dropdown adjustments.
+  * CFMAtlas/AtlasMapMarkers.lua - ECO drives the world-map pins through
+                                AtlasCFMOptions.ShowMapMarkers.
+  * CFMLoot/LootInit.xml      - Tooltip.lua and TooltipExtras.lua are not
+                                loaded; ECO owns tooltip presentation.
+  * CFMLoot/Core/Integrations.lua and Core/ProfessionHooks.lua - three anonymous
+                                frames are given names so the suite can find
+                                them.
+  * Locales/enUS/Core.lua     - two click strings ECO's tooltip looks up.
+Upstream's AtlasVersion.lua and its update-check strings are gone in 1.70.
 
 Bundled AtlasLoot TW Edition data
 ---------------------------------
@@ -479,3 +495,60 @@ bundle or copy its Lua, textures, or audio. modules/unitscan.lua is an independe
 implementation of the documented vanilla behaviour: quiet exact-name probes via
 TargetByName, a 0.1 second scan cadence, removal-after-detection by default, and a
 visible/audible alert. ECO uses Blizzard-native UI textures and sounds.
+
+================================================================================
+TurtleMail -- the mailbox
+by shirsig / sica, version 1.4.5
+
+Used by: Mail/ -- TurtleMail.lua, TurtleMail.xml, Calendar.lua, the five
+localisation files and the three textures
+
+**The bundled tree carries no LICENSE file** and no copyright line in any source
+file, the TOC or the README. Open source confirmed by the maintainer of this
+addon; recorded here rather than assumed, for the same reason as QuestHaste and
+DragonflightUI above -- the absence is real and the next person to read this
+deserves to know it was checked rather than skipped.
+
+Unlike those two, this one is **carried whole rather than ported**: it is a
+finished mailbox, it works, and there was nothing to gain by rewriting it into
+this addon's shapes. What is here is upstream 1.4.5 with the fixes below, each
+of which is commented at the point it was made.
+
+  * **`ADDON_LOADED` rejected the only event it would ever get.** The guard
+    compared `arg1` against "TurtleMail", and inside this addon the name the
+    client announces is "EquadisClassicOverhaul" -- so everything below that
+    line, the saved-variable merge included, simply never ran. Both names are
+    accepted, so a copy of the file dropped back into a standalone folder still
+    works.
+
+  * **The first-open setup was a one-shot that could fail once and never run
+    again.** The flag was set before the work, and the work reaches into
+    `SendMailPackageButton`'s regions by position; missing regions raised, which
+    aborted the whole of `MAIL_SHOW`. The flag now records whether the setup
+    succeeded.
+
+  * **The autocomplete list was aged against the wrong clock.** Names are
+    stamped and dropped after thirty days, and both halves used `GetTime` --
+    seconds since the client started, not a date. Nothing was ever pruned, by
+    anybody, ever. `time()` now, with the old session-number stamps re-stamped
+    rather than deleted.
+
+  * **A failed attachment left the send half-run.** The item was taken off the
+    front of the list and the early return put it back nowhere and left
+    `sendmail_sending` set, so the item vanished from the letter and the run
+    never ended. Reported as mail not sending until a reload.
+
+  * **`string.match` is Lua 5.1 and 1.12 is 5.0.** One call site, replaced with
+    `gsub`.
+
+  * **Two copies stop the game loading.** Both share the global `TurtleMail`
+    table and each build registers the same events, so `PLAYER_LOGIN` runs twice
+    and the hook installer -- which is not idempotent -- records its own hook as
+    the original and calls itself. Unbounded recursion during load-in. It cannot
+    be guarded from the inside, because "EquadisClassicOverhaul" sorts first and
+    the standalone copy overwrites the guard; so the bundled copy asks
+    `GetAddOnInfo` whether the standalone is enabled and stands down if it is.
+
+**Added rather than fixed**: names can be pinned to the top of the autocomplete
+list or forgotten from it, with the two gestures and the pin state said on the
+row's own tooltip.

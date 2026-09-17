@@ -1,6 +1,6 @@
 --[[ Equadis' Classic Overhaul :: self test
 
-  /eqob selftest -- what the offline suite cannot prove.
+  /eq selftest -- what the offline suite cannot prove.
 
   tests/run.lua boots the real addon against a fake 1.12 client and checks that
   it is internally consistent. It is thorough and it is not enough, because a
@@ -849,6 +849,156 @@ end
 OB.commands.rangedebug = {
     help = "report every client value used by the distance readout",
     Run = function(args) OB.RunRangeDebug() end,
+}
+
+--[==[ **Where threat could come from on this client, asked rather than assumed.**
+
+     The meter reads a packet the server sends: request `TWT_UDTSv4` on the party
+     or raid channel, receive `TWTv4=` back. That is the server's own threat
+     table, which is as good as the number can get -- no estimate from a combat
+     log beats being told.
+
+     Two questions follow from that and neither can be answered from here.
+
+     **Can a client mod do better?** Threat lives on the server and 1.12 never
+     sends a threat table to the client, so none of Nampower, SuperWoW, UnitXP
+     SP3 or ClassicAPI is documented to expose one. "Not documented" is not
+     "absent", and the cost of finding out is one command -- so this asks
+     `UnitXP` for the verbs it would plausibly use and `GetUnitField` for a field
+     that looks like threat, and prints exactly what came back.
+
+     **Can there be threat solo?** There is no group, so there is no channel to
+     request on, so nothing arrives -- which is why the window says "no threat
+     solo" rather than "no data". But `SendAddonMessage` has channels that exist
+     while alone, and whether the server answers a request on one of them is a
+     fact about the server that nobody here knows. `/eq threatdebug ask` sends on
+     them and says what to watch for.
+
+     **Separated from the report on purpose.** The plain command reads state and
+     sends nothing; `ask` puts messages on the guild channel, which is other
+     people's addon traffic. ]==]
+local THREAT_REQUEST = "TWT_UDTSv4"
+
+function OB.RunThreatDebug(send)
+    local m = OB.modules and OB.modules.threat
+
+    OB.Raw(GREY .. "Classic Overhaul threat debug " .. WHITE .. OB.version)
+
+    if not m then
+        OB.Raw(RED .. "  the threat module is not loaded")
+        return
+    end
+
+    -- ---------------------------------------------------------------------
+    -- where the meter stands
+    -- ---------------------------------------------------------------------
+
+    local raid = type(GetNumRaidMembers) == "function" and GetNumRaidMembers() or 0
+    local party = type(GetNumPartyMembers) == "function" and GetNumPartyMembers() or 0
+
+    OB.Raw("  " .. GREY .. "-- the meter --" .. WHITE)
+    OB.Raw("    group: raid=" .. raid .. " party=" .. party
+            .. "  solo=" .. tostring(m:Solo()))
+    OB.Raw("    seen a packet this session: " .. tostring(m.seenPacket and true or false))
+
+    if m.lastPacketAt then
+        OB.Raw("    last packet: " .. OB.Round(GetTime() - m.lastPacketAt)
+                .. "s ago")
+    end
+
+    OB.Raw("    window would say: " .. tostring(m:EmptyReason()))
+
+    -- ---------------------------------------------------------------------
+    -- what the client mods say, if anything
+    -- ---------------------------------------------------------------------
+
+    --[==[ Threat is server side in 1.12 and the client is never sent the table,
+         so every one of these is expected to answer nothing. Printed anyway:
+         "expected to" is where the last three surprises on this install came
+         from, and a nil here costs one line. ]==]
+    OB.Raw("  " .. GREY .. "-- client mods, which are not expected to have it --"
+            .. WHITE)
+
+    OB.Raw("    UnitXP dispatcher: " .. tostring(OB.HasUnitXP and OB.HasUnitXP()))
+    probe("UnitXP('threat','player','target')", UnitXP, "threat", "player", "target")
+    probe("UnitXP('threatSituation','player','target')",
+            UnitXP, "threatSituation", "player", "target")
+    probe("UnitXP('aggro','player','target')", UnitXP, "aggro", "player", "target")
+
+    OB.Raw("    GetUnitField: " .. type(GetUnitField))
+    probe("GetUnitField('target','threat')", GetUnitField, "target", "threat")
+
+    probe("UnitThreatSituation('player','target')",
+            UnitThreatSituation, "player", "target")
+    probe("GetThreatStatus()", GetThreatStatus)
+
+    --[==[ **Aggro is a different question from threat, and it is already
+         answerable.**
+
+         "Who is this mob attacking" needs no packet and no percentage, and
+         `targettarget` answers it for your own target on a bare client. SuperWoW
+         extends that to every nameplate on screen -- see `modules/nameplates`,
+         which resolves a plate's GUID and asks `guid .. "target"`.
+
+         So a solo aggro indicator is possible today whatever the rest of this
+         prints. A solo threat *percentage* is a different thing and is what the
+         lines above are about. ]==]
+    OB.Raw("  " .. GREY .. "-- aggro, which needs no packet --" .. WHITE)
+    OB.Raw("    target's target: "
+            .. tostring(type(UnitName) == "function" and UnitName("targettarget")))
+    OB.Raw("    SuperWoW nameplate units: " .. tostring(OB.Can
+            and OB.Can("nameplateunits")))
+
+    -- ---------------------------------------------------------------------
+    -- and the one thing worth trying
+    -- ---------------------------------------------------------------------
+
+    if not send then
+        OB.Raw("  " .. GREY
+                .. "-- run |cff69ccf0/eq threatdebug ask|r" .. GREY
+                .. " to request a packet on the channels that exist while solo"
+                .. WHITE)
+        return
+    end
+
+    if type(SendAddonMessage) ~= "function" then
+        OB.Raw(RED .. "  SendAddonMessage is missing; nothing can be asked")
+        return
+    end
+
+    local limit = "limit=" .. ((m:Config() and m:Config().rows) or 10)
+
+    OB.Raw("  " .. GREY .. "-- asking --" .. WHITE)
+
+    --[[ To yourself, which is the channel that always exists. Whether the
+         server treats a whisper-channel request as a request is exactly the
+         unknown. ]]--
+    local me = type(UnitName) == "function" and UnitName("player")
+
+    if me then
+        local ok = pcall(SendAddonMessage, THREAT_REQUEST, limit, "WHISPER", me)
+        OB.Raw("    WHISPER to self: " .. (ok and "sent" or "refused"))
+    end
+
+    --[[ **Guild is other people's addon traffic**, which is why this is behind
+         the argument rather than in the report. One small message. ]]--
+    if type(IsInGuild) == "function" and IsInGuild() then
+        local ok = pcall(SendAddonMessage, THREAT_REQUEST, limit, "GUILD")
+        OB.Raw("    GUILD: " .. (ok and "sent" or "refused"))
+    else
+        OB.Raw("    GUILD: not in one")
+    end
+
+    OB.Raw("  " .. GREY .. "now pull something and run |cff69ccf0/eq threatdebug"
+            .. "|r" .. GREY .. " again. If |cff69ccf0seen a packet|r has turned"
+            .. " true, the server answers while solo and the meter can." .. WHITE)
+end
+
+OB.commands.threatdebug = {
+    help = "where threat could come from here, and whether it can work solo",
+    Run = function(args)
+        OB.RunThreatDebug(args and string.find(string.lower(args), "ask", 1, true))
+    end,
 }
 
 --[[ Find every rung the client could possibly offer.

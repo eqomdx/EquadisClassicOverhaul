@@ -164,11 +164,72 @@ function M:EmbeddedDB()
     return nil
 end
 
+--[[ Every item the server's own database lists, by id -- see the header of
+     data/octowow_items.lua for where it comes from and what it cannot reach.
+     Read through here so a missing file is an ordinary answer, not an error. ]]--
+function M:OctoItemDB()
+    local db = EquadisClassicOverhaulItemDB
+    if type(db) == "table" and type(db.names) == "table" then return db end
+    return nil
+end
+
+--[==[ **"Referenced by a quest" is not "is a quest item", and the switch asks
+     the second one.**
+
+     This read pfQuest's `questItems` table, which lists **every item any quest
+     mentions** -- 3436 of them, including Runecloth, Major Healing Potion,
+     Major Mana Potion, Refreshing Spring Water and Dwarven Mild Cheese. So
+     "Hide Quest Items" hid ordinary loot: on a Twilight Stonecaller it removed
+     Runecloth at 32.7%, the single most common drop on the mob, while leaving
+     a Pumpkin Bag at 0.08% in the list. Reported as the drops not being
+     correct, and they were not -- the tooltip and the database window are two
+     views of one list, and only the tooltip filters.
+
+     The asymmetry is what gives it away: of one set of three greens from the
+     same mob at the same 8%, the Robe is in pfQuest's table and the Mantle and
+     Cowl are not. Nothing about those three differs to a player. The table is
+     simply a record of which items quests happen to name.
+
+     **The client knows the real answer.** `GetItemInfo` returns the item's
+     class, and a genuine quest item is in the Quest class -- the same string the
+     auction house builds its Quest category from, which is why it is taken from
+     there rather than written out in English.
+
+     **Nothing is hidden on a guess.** A class that is not Quest is an
+     authoritative no. An item the client cannot answer for yet is kept, which
+     is the rule this module already follows for the rarity floor one function
+     along: an uncached item never disappears merely because the client has not
+     got to it. Falling back to the embedded table here would put Runecloth back
+     for exactly the items least likely to be cached. ]==]
 function M:IsQuestItem(itemId)
-    local db = self:EmbeddedDB()
-    local questItems = db and db.questItems
-    if type(questItems) ~= "table" then return false end
-    return foreignById(questItems, itemId) and true or false
+    if type(GetItemInfo) ~= "function" then return false end
+
+    itemId = tonumber(itemId) or itemId
+    if not itemId then return false end
+
+    --[[ Warmed the same way `ItemInfo` warms it, so the answer improves rather
+         than staying "do not know" for the whole session. ]]--
+    local _, _, _, _, class = GetItemInfo(itemId)
+
+    if not class then
+        self:PrimeItem(itemId)
+        _, _, _, _, class = GetItemInfo(itemId)
+    end
+
+    if type(class) ~= "string" then return false end
+
+    return class == M.QuestItemClass()
+end
+
+--[==[ The client's own name for the Quest class, taken from the auction house
+     category rather than written out, so this is right in every locale. The
+     English fallback is for a build that ships neither global; being wrong
+     there costs a filter that stops matching, not one that hides the wrong
+     things. ]==]
+function M.QuestItemClass()
+    if type(AUCTION_CATEGORY_QUEST) == "string" then return AUCTION_CATEGORY_QUEST end
+    if type(ITEM_CLASS_QUEST) == "string" then return ITEM_CLASS_QUEST end
+    return "Quest"
 end
 
 function M:EmbeddedLoot(kind, sourceId)
@@ -1618,6 +1679,14 @@ function M:AtlasLootSource(name)
     return list[1]
 end
 
+local function filterText(value)
+    if type(value) ~= "string" then return nil end
+    value = string.gsub(value, "^%s+", "")
+    value = string.gsub(value, "%s+$", "")
+    if value == "" then return nil end
+    return string.lower(value)
+end
+
 local function searchMatch(query, name, id)
     if not query or query == "" then return false end
     local numeric = tonumber(query)
@@ -1646,11 +1715,83 @@ function M:AddSearchResult(byId, itemId, name, quality, provider)
     if provider then row.providers[provider] = true end
 end
 
-function M:SearchItems(text)
+--[[ **Everything a boss drops, found by the boss's name.**
+
+     "Search by the enemy that drops it" is the other half of the browser's job
+     and it had no answer at all: typing a boss's name searched item names, found
+     nothing, and said there was nothing to find.
+
+     Answered from the same index search already builds, walking sources rather
+     than names. Deliberately a separate entry point rather than folded into
+     `SearchItems`, so a name that is both -- and there are a few -- returns the
+     item under its own name and the boss's drops under the boss. ]]--
+function M:SearchBySource(text)
+    local query = filterText(text)
+    if not query then return {} end
+
+    self:BuildAtlasLootIndex()
+
+    local byId = {}
+    for itemId, sources in pairs(self.atlasLootItemSources or {}) do
+        for i = 1, table.getn(sources) do
+            local name = filterText(sources[i] and sources[i].name)
+            if name and string.find(name, query, 1, true) then
+                local itemName, _, quality = self:ItemInfo(itemId)
+                self:AddSearchResult(byId, itemId, itemName, quality, "AtlasLoot")
+                if byId[itemId] then byId[itemId].matchedSource = sources[i] end
+                break
+            end
+        end
+    end
+
+    --[[ Ordinary-world mobs too, so "what does a Defias Thug drop" works
+         outside a dungeon. The unit index is keyed by id, so the name has to be
+         resolved first. ]]--
+    local unitId = self:PfUnitIdByName(text)
+    if unitId then
+        local drops = self:DirectPfLoot(unitId)
+        for j = 1, table.getn(drops or {}) do
+            local drop = drops[j]
+            if drop and drop.id then
+                local itemName, _, quality = self:ItemInfo(drop.id)
+                self:AddSearchResult(byId, drop.id, itemName, quality, "ECO Loot DB")
+            end
+        end
+    end
+
+    local out = {}
+    for _, row in pairs(byId) do
+        local name, link, quality = self:ItemInfo(row.id)
+        row.name = name or row.name or ("Item " .. tostring(row.id))
+        row.link = link
+        if type(quality) == "number" then row.quality = quality end
+        table.insert(out, row)
+    end
+
+    table.sort(out, function(a, b)
+        local aq = tonumber(a.quality) or -1
+        local bq = tonumber(b.quality) or -1
+        if aq ~= bq then return aq > bq end
+        return string.lower(a.name or "") < string.lower(b.name or "")
+    end)
+
+    return out
+end
+
+function M:SearchItems(text, filter)
     text = tostring(text or "")
     text = string.gsub(text, "^%s+", "")
     text = string.gsub(text, "%s+$", "")
-    if text == "" then return {} end
+
+    --[[ **An empty box with a filter set is a real question**, and it used to
+         answer nothing. "Every blue in Scholomance" names no item, and refusing
+         to run without a word typed is what made the filters impossible to use
+         as filters rather than as a second search term. ]]--
+    if text == "" then
+        if type(filter) ~= "table" then return {} end
+        return self:FilteredCatalogue(filter)
+    end
+
     local query = string.lower(text)
     local byId = {}
 
@@ -1676,6 +1817,38 @@ function M:SearchItems(text)
             for itemId, name in pairs(pfNames) do
                 if searchMatch(query, name, itemId) then
                     self:AddSearchResult(byId, itemId, name, nil, lootProvider)
+                end
+            end
+        end
+    end
+
+    --[==[ **The server's own item list, which is what the search was missing.**
+
+         Every source above is a loot table, and a loot table knows an item only
+         if something drops it. Hearthstone is not dropped. Neither is any quest
+         reward, anything a vendor sells, anything crafted -- nor one single
+         OctoWow-custom item, because the snapshot is Turtle's. Typing the name
+         of the thing you were looking at on octowow.st found nothing, and it
+         read as the search being broken. The search was fine; it had 7,666
+         names and the server has three times that.
+
+         Added as a source rather than replacing the others: it carries no
+         drop information, so a hit from here alone lists the item with an empty
+         source list, and a hit the loot tables also know keeps its drops. ]==]
+    local octo = self:OctoItemDB()
+    if octo then
+        local quality = type(octo.quality) == "table" and octo.quality or nil
+        local numeric = tonumber(query)
+        if numeric then
+            if octo.names[numeric] then
+                self:AddSearchResult(byId, numeric, octo.names[numeric],
+                        quality and quality[numeric], "OctoWow DB")
+            end
+        else
+            for itemId, name in pairs(octo.names) do
+                if searchMatch(query, name, itemId) then
+                    self:AddSearchResult(byId, itemId, name,
+                            quality and quality[itemId], "OctoWow DB")
                 end
             end
         end
@@ -1730,7 +1903,402 @@ function M:SearchItems(text)
         if an ~= bn then return an < bn end
         return (tonumber(a.id) or 0) < (tonumber(b.id) or 0)
     end)
+
+    --[[ **Filtered last**, after the providers have all had their say. Filtering
+         each provider's contribution separately would let a row that only one of
+         them knows the quality of be dropped by the others. ]]--
+    if type(filter) == "table" then out = self:ApplyFilter(out, filter) end
+
     return out
+end
+
+--[[ Every item the index knows, narrowed by a filter and nothing else.
+
+     What a filter with no search term means. Bounded by the filter itself
+     rather than by a row cap, because a cap here would silently answer "these
+     forty" to a question that asked for all of them -- the browser's own list is
+     where the number on screen gets limited. ]]--
+function M:FilteredCatalogue(filter)
+    self:BuildAtlasLootIndex()
+
+    local byId = {}
+    for itemId, item in pairs(self.atlasLootItems or {}) do
+        self:AddSearchResult(byId, itemId, item.name, item.quality, "AtlasLoot")
+    end
+
+    local rows = {}
+    for _, row in pairs(byId) do
+        local name, link, quality = self:ItemInfo(row.id)
+        row.name = name or row.name or ("Item " .. tostring(row.id))
+        row.link = link
+        if type(quality) == "number" then row.quality = quality end
+        table.insert(rows, row)
+    end
+
+    rows = self:ApplyFilter(rows, filter)
+
+    table.sort(rows, function(a, b)
+        local aq = tonumber(a.quality) or -1
+        local bq = tonumber(b.quality) or -1
+        if aq ~= bq then return aq > bq end
+        return string.lower(a.name or "") < string.lower(b.name or "")
+    end)
+
+    return rows
+end
+
+-- ---------------------------------------------------------------------------
+-- filtering
+-- ---------------------------------------------------------------------------
+
+--[[ **Everything a row can be narrowed by, answered from one place.**
+
+     Search used to be a name and nothing else, which is the wrong shape for the
+     question people actually have: not "what is Thunderfury" -- they know -- but
+     "what blues drop in Scholomance", "what does this boss have", "what is worth
+     more than a one in ten chance". Every one of those is a field the data
+     already carries and the browser simply never offered.
+
+     The filter is a plain table so callers can build one field at a time, and
+     an absent field means *no opinion* rather than a default. That distinction
+     matters: `minChance = 0` is "anything, including unknown drop rates" and
+     `minChance = nil` is the same thing said by not asking, but `quality = 0`
+     is specifically poor-quality grey items. ]]--
+
+--[[ Does any one of an item's sources satisfy the source-shaped filters?
+
+     **Any, not all.** An item that drops from two bosses in two dungeons is a
+     Scholomance drop *and* a Stratholme drop, and filtering to Scholomance must
+     keep it. Requiring every source to match would hide exactly the items worth
+     knowing about. ]]--
+function M:SourcesMatchFilter(itemId, filter)
+    local wantInstance = filterText(filter.instance)
+    local wantSource = filterText(filter.source)
+    local wantType = filterText(filter.sourceType)
+    local minChance = tonumber(filter.minChance)
+
+    if not wantInstance and not wantSource and not wantType and not minChance then
+        return true, nil
+    end
+
+    local sources = self:GetItemSources(itemId)
+    for i = 1, table.getn(sources) do
+        local src = sources[i]
+        local ok = true
+
+        if wantInstance then
+            local inst = filterText(src.instance)
+            if not inst or not string.find(inst, wantInstance, 1, true) then ok = false end
+        end
+
+        --[[ The enemy that drops it, matched on the source's own name -- which
+             is the boss for a dungeon row and the mob for an ordinary-world
+             one, so "search by what drops it" is one field rather than two. ]]--
+        if ok and wantSource then
+            local name = filterText(src.name)
+            if not name or not string.find(name, wantSource, 1, true) then ok = false end
+        end
+
+        if ok and wantType then
+            local kind = filterText(src.sourceType)
+            if not kind or not string.find(kind, wantType, 1, true) then ok = false end
+        end
+
+        --[[ An unknown drop rate is stored as zero, and zero is not a small
+             chance -- it is no information. Asking for "at least 5%" must not
+             quietly return every row whose rate nobody recorded. ]]--
+        if ok and minChance and minChance > 0 then
+            local chance = tonumber(src.chance) or 0
+            if chance < minChance then ok = false end
+        end
+
+        if ok then return true, src end
+    end
+
+    return false, nil
+end
+
+
+--[[ **The item's type, slot and required level -- which is not what `ItemInfo`
+     answers.**
+
+     `ItemInfo` returns four values: name, link, quality, texture. It is the
+     name-resolution path, and it merges the client's cache with the bundled
+     Atlas-CFM and AtlasLoot tables so an item nobody has ever inspected still
+     has a name to show.
+
+     `ItemMatchesFilter` was reading it as though it were `GetItemInfo` itself:
+
+         local _, _, _, minLevel, itemType, subType, _, equipLoc = self:ItemInfo(id)
+
+     Four values into eight names. `minLevel` got the texture path, and
+     `itemType`, `subType` and `equipLoc` got nil -- every time, for every item.
+     The guard is `if wantType and itemType`, so with `itemType` always nil the
+     type filter never rejected anything: picking Weapon left every consumable
+     and every trade good exactly where it was. The slot and level filters were
+     dead the same way, and neither errored, because reading past the end of a
+     return list is nil rather than a fault.
+
+     So this asks the client directly, in the client's own order. 1.12
+     `GetItemInfo` answers name, link, quality, minLevel, type, subType,
+     stackCount, equipLoc, texture. There is no item level on this client --
+     `minLevel` is the level you must *be*, which is the number people mean when
+     they ask whether they can use something yet.
+
+     Cached because a filter pass asks this of every row, and the answer for an
+     item cannot change within a session. Only complete answers are kept: an
+     uncached item answers nil now and something real once the client has seen
+     it, and caching the nil would make that permanent. ]]--
+function M:ItemTypeInfo(itemId)
+    itemId = tonumber(itemId) or itemId
+    if not itemId then return nil, nil, nil, nil end
+
+    self.itemTypeInfo = self.itemTypeInfo or {}
+    local hit = self.itemTypeInfo[itemId]
+    if hit then return hit.itemType, hit.subType, hit.equipLoc, hit.minLevel end
+
+    if type(GetItemInfo) ~= "function" then return nil, nil, nil, nil end
+
+    local _, _, _, minLevel, itemType, subType, _, equipLoc = GetItemInfo(itemId)
+
+    --[[ Ask the client to fetch it if it does not have it yet, so the same
+         filter applied a moment later is sharper than it was. `PrimeItem` is
+         the existing hook for exactly this. ]]--
+    if not itemType and self.PrimeItem then self:PrimeItem(itemId) end
+
+    if itemType then
+        self.itemTypeInfo[itemId] = { itemType = itemType, subType = subType,
+                equipLoc = equipLoc, minLevel = minLevel }
+    end
+
+    return itemType, subType, equipLoc, minLevel
+end
+--[[ The item-shaped half: what the client can tell us about the item itself.
+
+     Read through `ItemInfo`, so an item the client has never cached answers nil
+     and is *kept* rather than filtered out. Dropping unknowns would make the
+     list shrink as you scrolled, which is the worst kind of wrong. ]]--
+function M:ItemMatchesFilter(row, filter)
+    local minQ, maxQ = tonumber(filter.minQuality), tonumber(filter.maxQuality)
+    local wantType = filterText(filter.itemType)
+    local wantSlot = filterText(filter.slot)
+    local maxLevel = tonumber(filter.maxRequiredLevel)
+
+    --[[ **A set of rarities, any of which will do.**
+
+         The browser sends this instead of a floor now, because the useful
+         questions are not ranges -- "epics and legendaries" is, but "blues and
+         purples but not greens" is not, and a floor can only say the first.
+         `minQuality`/`maxQuality` are still honoured underneath: they are a
+         range, this is a membership test, and callers that want a range have
+         one.
+
+         Unknown quality is *kept*, the same rule the rest of this function
+         follows: an item the client has never cached answers nil, and dropping
+         those would make the list shrink as you scrolled. ]]--
+    if type(filter.qualities) == "table" then
+        local q = tonumber(row.quality)
+        if q and not filter.qualities[q] then return false end
+    end
+
+    if minQ or maxQ then
+        local q = tonumber(row.quality)
+        if q then
+            if minQ and q < minQ then return false end
+            if maxQ and q > maxQ then return false end
+        end
+    end
+
+    local wantTypes = type(filter.itemTypes) == "table" and filter.itemTypes or nil
+    local wantSubTypes = type(filter.subTypes) == "table" and filter.subTypes or nil
+
+    if not wantType and not wantSlot and not maxLevel
+            and not wantTypes and not wantSubTypes then
+        return true
+    end
+
+    local itemType, subType, equipLoc, minLevel = self:ItemTypeInfo(row.id)
+
+    --[[ **Types and subtypes are one "any of these", not two filters.**
+
+         Ticking Weapon and then Daggers under it must not mean "a dagger that
+         is also every weapon" -- both are ways of saying the item qualifies, so
+         either satisfying is enough. Kept as a single test rather than two
+         because the alternative is an empty result for the most natural thing
+         somebody would click.
+
+         Unknown type is kept, the same rule as everywhere else here: an item
+         the client has never cached answers nil, and dropping those makes the
+         list shrink as you scroll. ]]--
+    if (wantTypes or wantSubTypes) and (itemType or subType) then
+        local ok = false
+
+        if wantTypes and itemType and wantTypes[string.lower(itemType)] then ok = true end
+        if not ok and wantSubTypes and subType
+                and wantSubTypes[string.lower(subType)] then
+            ok = true
+        end
+
+        if not ok then return false end
+    end
+
+    if wantType and itemType then
+        local haystack = string.lower(itemType .. " " .. (subType or ""))
+        if not string.find(haystack, wantType, 1, true) then return false end
+    end
+
+    if wantSlot and equipLoc then
+        if not string.find(string.lower(equipLoc), wantSlot, 1, true) then return false end
+    end
+
+    if maxLevel and tonumber(minLevel) and tonumber(minLevel) > maxLevel then
+        return false
+    end
+
+    return true
+end
+
+--[[ Narrow a result list. Kept apart from `SearchItems` so the same filters
+     apply to a dungeon's loot pool, which never went through a search at all. ]]--
+function M:ApplyFilter(rows, filter)
+    if type(filter) ~= "table" then return rows end
+
+    local out = {}
+    for i = 1, table.getn(rows) do
+        local row = rows[i]
+        if self:ItemMatchesFilter(row, filter) then
+            local ok, matched = self:SourcesMatchFilter(row.id, filter)
+            if ok then
+                --[[ The source that satisfied the filter travels with the row so
+                     the browser can say *why* it is in the list -- "Rattlegore,
+                     12%" rather than leaving the reader to click each one. ]]--
+                if matched then row.matchedSource = matched end
+                table.insert(out, row)
+            end
+        end
+    end
+
+    return out
+end
+
+--[[ **Every dungeon the data knows about**, for the filter's own list.
+
+     Gathered from Atlas-CFM's instance table rather than from the items,
+     because a dungeon nobody has an item indexed for should still be
+     selectable -- an empty result is an answer, and a missing entry looks like
+     a bug in the filter. ]]--
+--[==[ **Cached against the table it was built from, not cached forever.**
+
+     This kept the first answer it ever gave. `AtlasCFM.InstanceData` is another
+     addon's, and it is not necessarily populated when this is first asked --
+     Atlas fills it as its own files load. Asked too early, the cache took a
+     handful of instances, or none, and held them for the session however much
+     Atlas added afterwards.
+
+     The symptom is precise and does not look like a caching fault: the dungeon
+     filter lists `Any dungeon` and a few names in alphabetical order and will
+     not scroll past them. Nothing is wrong with the scrolling -- the list really
+     does end there, and a list shorter than its window has nothing to scroll.
+
+     `AtlasWorldDropSet` in this same file already had the answer: remember which
+     table the cache was built from and rebuild when it is a different one. The
+     count is checked as well, because Atlas fills the *same* table rather than
+     replacing it, so identity alone would never notice. ]==]
+local function instanceCount(source)
+    if type(source) ~= "table" then return 0 end
+
+    local n = 0
+    for _ in pairs(source) do n = n + 1 end
+    return n
+end
+
+function M:KnownInstances()
+    local source = AtlasCFM and AtlasCFM.InstanceData or nil
+    local count = instanceCount(source)
+
+    if self.knownInstances and self.knownInstancesFrom == source
+            and self.knownInstancesCount == count then
+        return self.knownInstances
+    end
+
+    local out = {}
+    if type(source) == "table" then
+        for key, data in pairs(source) do
+            local name = data and data.Name
+            if type(name) == "string" and name ~= "" then
+                table.insert(out, { key = key, name = name })
+            end
+        end
+    end
+
+    table.sort(out, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+
+    self.knownInstances = out
+    self.knownInstancesFrom = source
+    self.knownInstancesCount = count
+
+    return out
+end
+
+--[[ **A dungeon's whole loot pool, grouped by the boss that drops it.**
+
+     The question somebody standing in a dungeon has is not "where does this
+     item come from" but "what is in here, and who has it". Atlas-CFM answers it
+     against a map you have to click through boss by boss; this answers it as a
+     list, which is the form you can read while somebody is pulling.
+
+     Bosses come back in Atlas's own order rather than alphabetically, because
+     that order is roughly the order you meet them. ]]--
+function M:InstanceLoot(instanceKey)
+    if not instanceKey then return {} end
+    if not AtlasCFM or type(AtlasCFM.InstanceData) ~= "table" then return {} end
+
+    local data = AtlasCFM.InstanceData[instanceKey]
+    if type(data) ~= "table" then return {} end
+
+    self:BuildAtlasLootIndex()
+
+    local groups, byBoss = {}, {}
+    local function group(name)
+        name = name or "Unknown"
+        if byBoss[name] then return byBoss[name] end
+        local g = { boss = name, items = {} }
+        byBoss[name] = g
+        table.insert(groups, g)
+        return g
+    end
+
+    --[[ Walked from the loot tables rather than from the instance record,
+         because the instance record names bosses and the loot lives against the
+         table ids those names resolve to. One pass over the index we already
+         build for search costs nothing extra. ]]--
+    for itemId, sources in pairs(self.atlasLootItemSources or {}) do
+        for i = 1, table.getn(sources) do
+            local src = sources[i]
+            if src and sourceIdentity(src.instance) == sourceIdentity(data.Name) then
+                local name, link, quality = self:ItemInfo(itemId)
+                table.insert(group(src.name).items, {
+                    id = itemId,
+                    name = name or ("Item " .. tostring(itemId)),
+                    link = link,
+                    quality = quality,
+                    chance = tonumber(src.chance) or 0,
+                    matchedSource = src,
+                })
+            end
+        end
+    end
+
+    for g = 1, table.getn(groups) do
+        table.sort(groups[g].items, function(a, b)
+            local aq = tonumber(a.quality) or -1
+            local bq = tonumber(b.quality) or -1
+            if aq ~= bq then return aq > bq end
+            return string.lower(a.name or "") < string.lower(b.name or "")
+        end)
+    end
+
+    return groups
 end
 
 function M:GetItemSources(itemId)
@@ -1900,7 +2468,88 @@ function M:MergeCuratedSources(cfm, atlasLoot)
     return source
 end
 
+--[[ **The answer for one name, remembered.**
+
+     `M:Decorate` calls this for every tick a tooltip is on screen -- a few dozen
+     times for one hover -- and each call did four database lookups and asked
+     for two merges. The merges have caches of their own, but reaching them
+     costs two `tostring` calls and a concatenation to build the key, and the
+     four lookups above them were repeated in full every time.
+
+     Once the databases have answered, none of it can produce a different
+     result: they are loaded once and do not change while you hover a corpse. ]]--
+
+--[[ **How long a half-built answer is worth reusing.**
+
+     Before pfQuest's reverse index finishes, every lookup goes down a slower
+     path that *builds a fresh source table from raw loot rows on each call* --
+     which is the expensive case, and also the one a first-hover-after-login
+     lands in. Not caching it at all leaves that rebuild happening dozens of
+     times for a single hover.
+
+     Caching it permanently is worse: "nothing yet" would become the answer for
+     the rest of the session, which looks exactly like a database that does not
+     work.
+
+     A second is the compromise. One hover reuses one answer; the next hover
+     asks again and picks up the finished index the moment it exists. ]]--
+local BUILDING_TTL = 1
+
+function M:CachedSource(key, state, source)
+    if state == "building" then
+        self.buildingCache = self.buildingCache or {}
+        self.buildingCache[key] = { source = source or false, at = GetTime() }
+        return source
+    end
+
+    self.sourceCache = self.sourceCache or {}
+    self.sourceCache[key] = source or false
+
+    --[[ The half-built entry goes when the real one arrives, or a stale one
+         could outlive the answer that replaced it. ]]--
+    if self.buildingCache then self.buildingCache[key] = nil end
+
+    return source
+end
+
+--[[ Returns the source, whether it was found at all, and the state it was
+     stored with. **The state has to come back**: a caller that sees a `nil`
+     source with no state reads it as "asked and answered, nothing here" and
+     stops retrying -- so a cached `building` answer would freeze the tooltip
+     half-finished for as long as the entry lived. ]]--
+function M:LookupSource(key)
+    if self.sourceCache then
+        local hit = self.sourceCache[key]
+
+        --[[ `false` is a remembered "nothing drops from this", which is the
+             common answer for most things you hover. ]]--
+        if hit == false then return nil, true end
+        if hit ~= nil then return hit, true end
+    end
+
+    if self.buildingCache then
+        local entry = self.buildingCache[key]
+
+        if entry and (GetTime() - entry.at) < BUILDING_TTL then
+            if entry.source == false then return nil, true, "building" end
+            return entry.source, true, "building"
+        end
+    end
+
+    return nil, false
+end
+
+function M:ForgetSources()
+    self.sourceCache = nil
+    self.buildingCache = nil
+end
+
 function M:GetSourceByName(name)
+    if not name then return nil end
+
+    local cached, found, cachedState = self:LookupSource(name)
+    if found then return cached, cachedState end
+
     -- Both bundled curated databases are additive. pfQuest then augments the
     -- combined boss pool with ordinary-world/reverse-loot rows.
     local cfm = self:AtlasSource(name)
@@ -1908,9 +2557,13 @@ function M:GetSourceByName(name)
     local curated = self:MergeCuratedSources(cfm, atlasLoot)
     local pf, state = self:PfSource(name)
 
-    if curated and pf then return self:MergeSources(curated, pf) end
-    if curated then return curated, state end
-    return pf, state
+    if curated and pf then
+        return self:CachedSource(name, state, self:MergeSources(curated, pf)), state
+    end
+
+    if curated then return self:CachedSource(name, state, curated), state end
+
+    return self:CachedSource(name, state, pf), state
 end
 
 
@@ -1921,28 +2574,26 @@ function M:GetSourceByUnitId(unitId, name)
     unitId = normalizedId(unitId)
     if not unitId then return self:GetSourceByName(name) end
 
+    --[[ Keyed by the id and the name together. The id alone is not enough: the
+         curated half of the answer is looked up by name, so two tooltips with
+         the same id and different names are two different answers. ]]--
+    local key = "#" .. tostring(unitId) .. "|" .. tostring(name)
+
+    local cached, found, cachedState = self:LookupSource(key)
+    if found then return cached, cachedState end
+
     local cfm = name and self:AtlasSource(name) or nil
     local atlasLoot = name and self:AtlasLootSource(name) or nil
     local curated = self:MergeCuratedSources(cfm, atlasLoot)
     local pf, state = self:PfSourceById(unitId, name)
 
-    if curated and pf then return self:MergeSources(curated, pf), state end
-    if curated then return curated, state end
-    return pf, state
-end
-
-function M:GetMouseoverSource()
-    if type(UnitExists) == "function" and UnitExists("mouseover")
-            and type(UnitPlayerControlled) == "function"
-            and UnitPlayerControlled("mouseover") then
-        return nil
+    if curated and pf then
+        return self:CachedSource(key, state, self:MergeSources(curated, pf)), state
     end
 
-    local name
-    if type(UnitName) == "function" then name = UnitName("mouseover") end
-    if not name or name == "" then return nil end
+    if curated then return self:CachedSource(key, state, curated), state end
 
-    return self:GetSourceByName(name)
+    return self:CachedSource(key, state, pf), state
 end
 
 function M:IsWorldDrop(row, cutoff)

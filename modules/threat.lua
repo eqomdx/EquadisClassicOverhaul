@@ -234,7 +234,22 @@ local M = OB.RegisterModule({
          should be a decision. `defaultEnabled`, not a setting called `enabled`
          in the defaults table -- the binder reads `modulesEnabled` and nothing
          else, so the latter would look like it worked and would not. ]]--
-    defaultEnabled = false,
+    --[==[ **On, like everything else.**
+
+         This module shipped off. So did twelve others, which meant a fresh
+         install of this addon did very nearly nothing until somebody went
+         through the Modules page switching things on -- and nothing on screen
+         said that was the step they were missing. It was reported as settings
+         not carrying across to a new character, which is what an addon that is
+         installed and not running looks like from outside.
+
+         The flag exists for a feature that is not finished, where drawing
+         nothing is indistinguishable from being broken. None of the thirteen
+         were that; they were caution, and the setup walkthrough is where that
+         caution belongs now -- it goes through every module in turn and offers
+         exactly this switch, with a description of what the module does. A
+         decision somebody is walked through is better than a default they never
+         find. ]==]
 
     defaults = {
         x = 0, y = 0,
@@ -329,6 +344,13 @@ local M = OB.RegisterModule({
          the layout twice. See modules/damage.lua for what each one is for. ]]--
     options = {
         { "Window", "__s_window", "section", "window" },
+
+        --[[ **Shown is not Enabled.** The Modules page switch decides whether
+             this subsystem runs at all. This one only decides whether the
+             window is on screen, so the numbers are still there when you show
+             it again. `@moduleShow:` sends the row to `modulesShown`, which is
+             what `OB.ModuleShown` reads and the draw loop honours. ]]--
+        { "Show The Meter", "@moduleShow:threat", "boolean" },
         { "Width", "width", "slider", 100, 500, 1 },
         { "Rows Shown", "rows", "slider", 3, 40, 1 },
         { "X Position", "x", "slider", -2000, 2000, 1 },
@@ -420,7 +442,25 @@ local M = OB.RegisterModule({
          measurement. They are the parser's own list rather than a second copy:
          a list that drifted would attribute threat to the wrong abilities and
          look like it was working. ]]--
-    events = { "CHAT_MSG_ADDON", "PLAYER_ENTERING_WORLD", "PLAYER_REGEN_ENABLED" },
+    --[[ **The window is only drawn when something marks it dirty**, and three
+         of the things that decide whether it is on screen at all were not on
+         this list.
+
+         `OnDraw` hides the window when you are solo and `showSolo` is off, and
+         again when `hideOutOfCombat` is on and you are not fighting. Both are
+         states that *end* -- you join a group, you pull -- and neither ending
+         was an event this module heard. So the window hid itself once and
+         stayed hidden: nothing asked for another draw until a threat packet
+         arrived, and solo no packet ever arrives. That is the whole of "the
+         threat meter is not showing up".
+
+         `PLAYER_REGEN_DISABLED` is combat starting. The two roster events are
+         the answer to `Solo()` changing. None of them carry threat data; they
+         exist so the window is redrawn when the reason it was hidden stops
+         being true. ]]--
+    events = { "CHAT_MSG_ADDON", "PLAYER_ENTERING_WORLD", "PLAYER_REGEN_ENABLED",
+               "PLAYER_REGEN_DISABLED",
+               "PARTY_MEMBERS_CHANGED", "RAID_ROSTER_UPDATE" },
 
     --[[ Ticked so the request below can be sent on a clock. The window itself
          redraws on the packet, not on the tick. ]]--
@@ -459,7 +499,18 @@ function M:NoteAction(line)
     if not line then return end
     if line.source ~= UnitName("player") then return end
 
-    local spell = line.attack
+    --[[ **`spell`, not `attack`.** `OB.ReadCombatLine` returns
+         `{ source, spell, target, amount, school, kind }` and has never
+         returned an `attack` field -- the damage meter, which reads the same
+         table, has always read `spell`.
+
+         So this was nil on every line, the guard below returned on every line,
+         and nothing was ever noted. The window that attributes a threat change
+         to the ability that caused it was closed before it opened, which is why
+         the meter could show threat moving and never say what moved it. It did
+         not error, because a nil field is not a fault -- it is just a name
+         nobody wrote. ]]--
+    local spell = line.spell
     if not spell or spell == "" then return end
 
     if self.windowSpell == nil then
@@ -540,10 +591,12 @@ function M:CloseWindow(change)
     return OB.LearnThreatFor(spell, change / count)
 end
 
-function M:OnBind()
-    self.entries = {}
-    self.seenPacket = false
-end
+--[[ **There was a second `M:OnBind` further down this file**, and Lua does not
+     warn about that: the later definition simply replaced this one, so
+     everything here had never run since the day it was written. The window
+     builder further down is the one that survived; `seenPacket` is folded into
+     it, and this is left as the note explaining why it is set there rather than
+     here. ]]--
 
 --[[ **Threat per second, measured between packets.**
 
@@ -698,6 +751,22 @@ function M:OnEvent()
          already happened. ]]--
     if event == "PLAYER_REGEN_ENABLED" then
         if self:Config().clearOutOfCombat then self:Forget() end
+
+        --[[ Marked dirty even when the list is kept, because `hideOutOfCombat`
+             decides visibility from combat state and leaving combat is exactly
+             when that answer changes. `Forget` marks it too; doing it twice
+             costs a flag. ]]--
+        OB.SetDirty(self)
+        return
+    end
+
+    --[[ Combat starting, and the group changing, carry no threat data. They are
+         here because they are the two ways the window stops being hidden --
+         see the event list above. ]]--
+    if event == "PLAYER_REGEN_DISABLED"
+            or event == "PARTY_MEMBERS_CHANGED"
+            or event == "RAID_ROSTER_UPDATE" then
+        OB.SetDirty(self)
         return
     end
 
@@ -842,6 +911,70 @@ function M:TestStop()
     OB.SetDirty(self)
 end
 
+--[==[ **Your own threat as a colour, for anything that wants to show it.**
+
+     The nameplate's health bar asks for this. It could have had a ramp of its
+     own -- the maths is four lines -- and then there would be two answers to
+     "what does about to pull look like", drifting apart the first time either
+     palette was touched. The meter owns the colours and this hands them out.
+
+     **Nil when there is no reading**, which is most of the time: threat comes
+     off the addon channel and there is nothing to say solo, out of combat, or
+     with the meter switched off. A caller that gets nil is expected to fall
+     back to whatever it drew before rather than to draw "safe" -- green for "no
+     data" is a claim, and the wrong one.
+
+     `rampFraction` is defined further down this file, so this is a method
+     rather than a local: it is resolved when called, not when loaded. ]==]
+function OB.MyThreatColor()
+    local m = OB.modules and OB.modules.threat
+    if not m or not OB.ModuleEnabled("threat") then return nil end
+
+    local mine = m:Mine()
+    if not mine or not mine.percent then return nil end
+
+    return m:OwnRampColor(mine)
+end
+
+--[==[ **How close the next person is to taking it off you**, as a fraction of
+     your own threat -- the tank's reading, where `MyThreatColor` above is the
+     damage dealer's.
+
+     A damage dealer wants to know how close *they* are to the tank. A tank wants
+     the opposite: how close the closest *other* person is to them. Same packet,
+     opposite question, and the nameplates ask this one when they are told the
+     player is tanking.
+
+     Raw threat rather than the packet's percent, because the percent is measured
+     against whoever the server calls the tank -- and if that is somebody else,
+     everyone's number is relative to the wrong person. Two raw totals divide
+     into a ratio that means the same thing whoever the server thinks is in
+     charge.
+
+     **Nil when there is nothing to read**, for the reason `MyThreatColor` gives:
+     solo, out of combat or with the meter off there is no packet, and a caller
+     is expected to fall back rather than draw "safe". Nil too when you have no
+     threat of your own -- there is no fraction of nought, and "holding" a mob you
+     have not touched is not a state anybody wants painted. ]==]
+function OB.RunnerUpThreatRatio()
+    local m = OB.modules and OB.modules.threat
+    if not m or not OB.ModuleEnabled("threat") then return nil end
+
+    local mine = m:Mine()
+    if not mine or not mine.threat or mine.threat <= 0 then return nil end
+
+    local highest = 0
+
+    for name, entry in pairs(m.entries or {}) do
+        if name ~= mine.name and type(entry.threat) == "number"
+                and entry.threat > highest then
+            highest = entry.threat
+        end
+    end
+
+    return highest / mine.threat
+end
+
 --[[ This player's own entry, which is what every reading is relative to. ]]--
 function M:Mine()
     local name = UnitName("player")
@@ -960,6 +1093,15 @@ end
      applying to all bars", which it was, and it hid the class path completely.
 
      A fallback must be the dullest of the options, never the loudest. ]]--
+--[[ Your own row's colour, which is the reading the whole window exists for.
+     Pulled out of `RowColor` so the nameplate can ask for the same thing
+     without going through a row it does not have. ]]--
+function M:OwnRampColor(mine)
+    local cfg = self:Config()
+    return OB.Ramp(cfg.safeColor, cfg.closeColor, cfg.pullColor,
+            rampFraction(mine, mine))
+end
+
 function M:RowColor(entry, mine)
     local cfg = self:Config()
 
@@ -995,8 +1137,17 @@ end
 local HEADER_H = OB.HEADER_H
 
 function M:OnBind()
+    --[[ Cleared so switching the subsystem on again explains the solo hide
+         again, rather than only ever doing it once per install. ]]--
+    self.saidSolo = nil
+
     self.entries = self.entries or {}
     self.rows = self.rows or {}
+
+    --[[ Whether a packet has been seen *this* session. Kept here because this
+         is the `OnBind` that actually runs -- an earlier one further up the
+         file set it and was silently replaced by this definition. ]]--
+    if self.seenPacket == nil then self.seenPacket = false end
 
     if not self.frame then
         local f = CreateFrame("Frame", "EqOBThreat", UIParent)
@@ -1293,6 +1444,102 @@ function M:EmptyReason()
     return "waiting for a pull"
 end
 
+--[[ **Edit mode borrows the lock and gives it back.**
+
+     This window has its own `locked`, which is what somebody uses to stop
+     nudging it once it is placed. Edit mode says *everything moves*, and a
+     window that is outlined like all the others and then refuses to be dragged
+     is the same non-answer the map used to give.
+
+     So the lock is overridden while edit mode is on and **restored when it goes
+     off**, not cleared -- somebody who locked this deliberately still has it
+     locked afterwards. The same bargain the damage meter's windows make. ]]--
+function M:SetDragMode(on)
+    if on and not OB.ModuleEnabled("threat") then
+        Say("switch the threat meter on first.")
+        return false
+    end
+
+    local cfg = self:Config()
+    if not cfg then return false end
+
+    if on then
+        --[[ Remembered once, so toggling edit mode twice does not record the
+             borrowed state as if it were the real one. ]]--
+        if self.lockedBeforeEdit == nil then
+            self.lockedBeforeEdit = cfg.locked and true or false
+        end
+
+        cfg.locked = false
+
+        if self.frame then OB.MarkMovable(self.frame, "Threat Meter") end
+
+        return true
+    end
+
+    if self.lockedBeforeEdit ~= nil then
+        cfg.locked = self.lockedBeforeEdit
+        self.lockedBeforeEdit = nil
+    end
+
+    return true
+end
+
+--[[ **Back to the middle of the screen with every setting as it shipped.**
+
+     The way out of a window nobody can find. A meter dragged off the edge, or
+     carried over from a larger resolution, is saved at coordinates that are
+     nowhere on this screen -- and from the inside that is indistinguishable
+     from a meter that does not work, which is how it gets reported.
+
+     Position first and separately, because that is the half that matters: a
+     window at the centre can be seen, and whatever else is wrong with it can
+     then be seen too.
+
+     Every setting with it, because the other way to hide this window is a
+     switch -- Show When Solo off while solo, Hide Out Of Combat on out of
+     combat -- and somebody who cannot find the window cannot find which switch
+     did it either. ]]--
+function M:ResetEverything()
+    local cfg = self:Config()
+    local defaults = (OB.modules.threat and OB.modules.threat.defaults) or {}
+
+    --[[ Wiped rather than overwritten key by key: a setting added since this
+         profile was made has no default to copy over it, and would survive a
+         reset that claimed to have cleared everything. ]]--
+    for key in pairs(cfg) do cfg[key] = nil end
+
+    OB.DeepMerge(cfg, OB.DeepCopy(defaults))
+
+    --[[ Dead centre, which is the one place on screen that exists at every
+         resolution. Set after the defaults are back so it wins even if the
+         shipped position is not the middle. ]]--
+    cfg.x = 0
+    cfg.y = 0
+
+    --[[ And visible: the subsystem's own Show tick is stored outside the
+         module's settings, so clearing those would leave a meter that is reset,
+         centred and still switched off. ]]--
+    if OB.profile and OB.profile.modulesShown then
+        OB.profile.modulesShown.threat = nil
+    end
+
+    self.saidSolo = nil
+
+    if self.frame then
+        self.frame:ClearAllPoints()
+        self.frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+        self.frame:Show()
+    end
+
+    self:OnStyle()
+
+    Say("threat meter reset -- centre of the screen, every setting as it "
+            .. "shipped.")
+
+    return true
+end
+
 function M:OnDraw()
     local cfg = self:Config()
     if not self.frame then return end
@@ -1318,6 +1565,22 @@ function M:OnDraw()
          city, and a preview that vanished exactly when somebody went looking
          for it would be the trap this setting exists to avoid. ]]--
     if self:Solo() and not cfg.showSolo and not OB.testMode then
+        --[[ **Said once, because silence reads as broken.**
+
+             Switching this subsystem on and seeing nothing is
+             indistinguishable from a module that does not work. Solo, with
+             `showSolo` off, that is exactly what happens: the window hides on
+             the first draw and there is no group coming to un-hide it.
+
+             The rule itself is right and stays. What was missing was anybody
+             saying so. Cleared on bind, so switching it on again explains
+             itself again. ]]--
+        if not self.saidSolo then
+            self.saidSolo = true
+            Say("hidden while you are solo -- threat comes from your group. "
+                    .. "Show When Solo keeps it up anyway.")
+        end
+
         self.frame:Hide()
         return
     end
@@ -1407,7 +1670,9 @@ function M:OnDraw()
                  and a two digit one on the next put the rates in different
                  places. That is the reported "not anchored to the left", and a
                  column has to be its own string to be a column at all. ]]--
-            OB.SetBarText(row, row.left, self:RowName(cfg, i, entry), 0)
+            --[[ Held, not drawn. The name's room depends on the two number
+                 columns to its right, which only AlignColumns knows. ]]--
+            row.leftFull = self:RowName(cfg, i, entry)
 
             -- all three placed once the widest row is known; see M:AlignColumns
             row.center:SetText(cfg.showThreat
@@ -1499,7 +1764,7 @@ function M:DrawUntilPull(mine)
 
     --[[ The same three columns the rows use, so the summary lines up with what
          it summarises: threat to go, your rate, your share of the tank's. ]]--
-    bar.left:SetText("Threat Until Pull")
+    bar.leftFull = "Threat Until Pull"
     bar.center:SetText(cfg.showThreat and OB.ShortNumber(left) or "")
 
     bar.extra:SetText("")
@@ -1507,7 +1772,6 @@ function M:DrawUntilPull(mine)
     bar.right:SetText(cfg.showPercent
             and (OB.Round(mine.percent or 0) .. "%") or "")
 
-    OB.PlaceText(bar, bar.left, 0)
 end
 
 --[[ **The background stops where the rows stop.**
@@ -1576,7 +1840,7 @@ function M:AlignColumns()
     for i = 1, table.getn(self.rows) do table.insert(bars, self.rows[i]) end
     if self.frame.pull then table.insert(bars, self.frame.pull) end
 
-    local pct, figures, leftUsed = 0, 0, 0
+    local pct, figures = 0, 0
 
     for i = 1, table.getn(bars) do
         local row = bars[i]
@@ -1588,8 +1852,6 @@ function M:AlignColumns()
             local f = row.center:GetStringWidth() or 0
             if f > figures then figures = f end
 
-            local l = row.left:GetStringWidth() or 0
-            if l > leftUsed then leftUsed = l end
         end
     end
 
@@ -1603,16 +1865,25 @@ function M:AlignColumns()
          of the drawing, or the gap it used to occupy would still be there with
          nothing in it. ]]--
     local gap = 8
-    local pctAt = OB.ColumnStart(bars[1], pct, leftUsed)
+    local pctAt = OB.ColumnStart(bars[1], pct, 0)
     local figuresAt = pctAt - gap - figures
 
-    local floorAt = leftUsed + 6
-    if figuresAt < floorAt then figuresAt = floorAt end
+    --[[ **The name gives way, not the numbers.**
+
+         Both columns used to be shoved rightward by a long name -- the percent
+         by ColumnStart and the figure by a floor of its own -- which walked the
+         percentage off the right-hand edge of the window and cut it in half.
+         The room left over is now the name's budget, and a name too long for it
+         is trimmed. ]]--
+    local room = OB.NameRoom(bars[1], pct + gap + figures)
 
     for i = 1, table.getn(bars) do
         local row = bars[i]
 
         if row:IsShown() then
+            OB.FitTextTo(row.left, row.leftFull, room)
+            OB.PlaceText(row, row.left, 0)
+
             OB.PlaceTextLeftAt(row, row.right, pctAt)
             OB.PlaceTextLeftAt(row, row.center, figuresAt)
         end

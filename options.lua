@@ -53,7 +53,43 @@ local CONTENT_Y = -62
 
 local PAGE_W = PANEL_W - CONTENT_X - 20
 local PAGE_H = PANEL_H + CONTENT_Y - 60
-local COLUMN_X = 288   -- left edge of the second column
+
+--[==[ ~~COLUMN_X~~ **One column that scrolls, rather than two that do not.**
+
+     A page's rows used to be assigned a column when they were built, and any
+     that would have run off the bottom of column one spilled into column two.
+     The note that argued for it said a scrollbar was worse: 1.12's scroll frames
+     are fiddly and the second column was sitting right there.
+
+     What it actually produces is a page read in two directions. The tail of one
+     list continues at the top of the next column, so **Appearance** sits beside
+     **Buttons Shown** rather than after it, and where a setting lands depends on
+     how many rows above it a particular class and profile happened to show. Two
+     people with the same version find the same control in different places, and
+     neither order is the one the module wrote.
+
+     It also runs out. The Action Bars page is eighty-three rows; two columns
+     hold about twenty-four, and everything past that was drawn below the panel
+     where nothing could reach it -- which is the same failure the second column
+     was introduced to fix, one column later.
+
+     So: one column, in the order the module wrote, and the page scrolls.
+
+     **Not through a `ScrollFrame`**, which was tried and hid the whole
+     interface. The lines box below this file already says why and said it first:
+     a scroll frame on 1.12 wants a child whose height is known before it is
+     filled, and there are two more pieces of engine behaviour behind it -- the
+     child's anchoring, and a clipping rectangle that swallows anything else
+     parented inside. None of the three is visible to a harness that models
+     frames as tables, and getting any one wrong draws a page of controls nowhere
+     with nothing to say so.
+
+     Same answer as the lines box, then: keep the frames where they were and move
+     what is drawn. `LayoutPage` already computes every row's position and
+     already decides which rows are drawn, so scrolling is one addition and
+     clipping is one more condition on a decision it was making anyway. ]==]
+local SCROLL_W = 10        -- the bar, in the twenty pixel right margin
+local SCROLL_STEP = 42     -- one wheel notch: about two rows
 
 -- how far down the page the next control sits, per kind
 local ROW_ADVANCE = {
@@ -63,6 +99,11 @@ local ROW_ADVANCE = {
     action = 26,
     color = 26,
     list = 50,
+
+    --[[ A placeholder. Every `lines` row measures itself off the height it was
+         asked for -- see `addLines` -- so this is only what an unsized one
+         would get. ]]--
+    lines = 120,
     header = 24,
     button = 28,
     editbox = 28,
@@ -128,6 +169,20 @@ end
 local function readValue(w)
     local t = container(w)
     if not t then return nil end
+
+    --[[ A module may expose an effective value for a key whose saved value is
+         intentionally absent. UnitFrames uses this for per-frame overrides:
+         an untouched frame follows the shared value, and the control should
+         display that effective value instead of looking blank or jumping to a
+         slider minimum. ]]--
+    if w.module then
+        local m = OB.modules[w.module]
+        if m and m.OptionValue then
+            local value, handled = m:OptionValue(w.key, t)
+            if handled then return value end
+        end
+    end
+
     return OB.Get(t, w.key)
 end
 
@@ -205,6 +260,14 @@ OB.predicates.power_rage = function()
     return m and (m.ptype == 1)
 end
 
+--[[ **Is the subsystem this row belongs to switched off?**
+
+     Takes the row rather than naming a module, so one predicate serves all
+     twelve rather than twelve near-identical ones. ]]--
+OB.predicates.module_off = function(w)
+    return w and w.module and not OB.ModuleEnabled(w.module)
+end
+
 --[[ Generalises Equadis' Threat Meter's dependsOn: a plain key, a negated key,
      or a named predicate for anything that is not a simple flag. ]]--
 local function testDependency(w, dep)
@@ -213,7 +276,10 @@ local function testDependency(w, dep)
     if string.sub(dep, 1, 1) == "@" then
         local fn = OB.predicates[string.sub(dep, 2)]
         if not fn then return true end
-        return fn() and true or false
+        --[[ Handed the row. Every predicate written before this one ignores the
+             argument, and one that needs to know which row is asking -- "is my
+             own subsystem off" -- cannot be written without it. ]]--
+        return fn(w) and true or false
     end
 
     local negate = false
@@ -223,7 +289,21 @@ local function testDependency(w, dep)
     end
 
     local t = container(w)
-    local truthy = (t and OB.Get(t, dep)) and true or false
+    local value = t and OB.Get(t, dep)
+
+    -- Keep dependency visibility in step with the value the control itself
+    -- shows. Without this, a per-frame UnitFrames colour can visibly inherit
+    -- "Set The Name Color" while its Name Color row is still hidden because
+    -- the raw override key is nil.
+    if t and w.module then
+        local m = OB.modules[w.module]
+        if m and m.OptionValue then
+            local resolved, handled = m:OptionValue(dep, t)
+            if handled then value = resolved end
+        end
+    end
+
+    local truthy = value and true or false
 
     if negate then return not truthy end
     return truthy
@@ -883,6 +963,36 @@ local function describeRow(opt, scope, moduleId)
              one. Reset to column one by the next section marker. ]]--
         w.kind = "column"
         w.column = opt[4] or 2
+    elseif kind == "lines" then
+        --[==[ **A readout, not a control.**
+
+             A list of things the addon knows -- scan targets, and whatever wants
+             one next -- shown where they are edited rather than printed into
+             chat by a button. "List All Targets" wrote them to the chat frame,
+             which is a strange place to look for the contents of a setting you
+             are standing in front of.
+
+             `opt[4]` is a function answering an array of strings, asked whenever
+             the page refreshes; `opt[5]` is how tall the box should be. Nothing
+             is stored behind it, so like an action it has no scope. ]==]
+        w.kind = "lines"
+        w.provider = opt[4]
+        w.height = opt[5]
+        w.width = opt[6]
+
+        --[==[ **And optionally a way to take one off.**
+
+             A readout of a list you can only add to is half a control. Both
+             lists this shows -- scan targets, and the automatic roll names --
+             were editable only by retyping the whole comma-separated string or
+             by remembering a slash command, and removing one entry meant
+             finding it in a run of text and deleting the right comma with it.
+
+             `opt[7]` is a function taking the entry that was clicked. Optional,
+             because a readout of something that is not a list of removable
+             things -- and there will be one -- should not grow a row of buttons
+             that cannot mean anything. ]==]
+        w.remove = opt[7]
     else
         w.kind = "list"
         w.values = kind
@@ -1002,7 +1112,7 @@ local function fault(label, err)
     table.insert(OB.panelFaults, { label = label, err = tostring(err) })
 
     Say("|cffff5511settings panel:|r " .. label .. " failed -- " .. tostring(err))
-    Say("the rest of the panel still works. |cff69ccf0/eqob selftest|r lists this again.")
+    Say("the rest of the panel still works. |cff69ccf0/eq selftest|r lists this again.")
 end
 
 --[[ Everything about a row that can throw, in one place.
@@ -1017,7 +1127,12 @@ local function updateRow(widget)
     if widget.Update then widget:Update() end
 
     local visible = true
-    if not widget.alwaysShow and widget.w and widget.w.key ~= "" then
+    --[[ A row with no config key still gets asked, so long as it declares a
+         dependency. The guard was there because a keyless row -- a header, a
+         button -- has no setting to test; a row that names a predicate has
+         said what to test instead. ]]--
+    if not widget.alwaysShow and widget.w
+            and (widget.w.key ~= "" or widget.w.dependsOn) then
         visible = rowVisible(widget.w)
     end
 
@@ -1085,6 +1200,181 @@ local function addAction(page, w)
     return button
 end
 
+--[==[ **A scrollable readout of whatever a module wants to show.**
+
+     Built from a fixed set of font strings and an offset rather than a
+     `ScrollFrame`. A scroll frame on 1.12 wants a child whose height is known
+     before it is filled, and the height here depends on the answer -- so the box
+     stays put, the lines are reused, and scrolling moves which entries are
+     written into them. That is also why it costs nothing when nothing is
+     scrolling.
+
+     The wheel is claimed only while the cursor is over the box. Claiming it for
+     the page would take the wheel away from the panel's own scrolling, which is
+     how a list ends up being the only thing anybody can scroll. ]==]
+local LINE_HEIGHT = 12
+
+local function addLines(page, w)
+    local holder = CreateFrame("Frame", nil, page)
+
+    holder:SetWidth(w.width or 190)
+    holder:SetHeight(w.height or 120)
+
+    --[[ Sunken rather than raised: this is a hole in the page with things in
+         it, not a control sitting on top of one. ]]--
+    if OB.SkinWindow then
+        OB.SkinWindow(holder, 1)
+        if OB.skin and holder.SetBackdropColor then
+            local s = OB.skin.sunken
+            holder:SetBackdropColor(s[1], s[2], s[3], s[4] or 0.85)
+        end
+    end
+
+    --[==[ **The row is as tall as the box it was asked for.**
+
+         `ROW_ADVANCE.lines` calls itself a placeholder and says every `lines`
+         row measures itself off its own height -- and nothing here did that, so
+         every one of them advanced by the same 120 whatever height it had
+         been given. It never showed, because the only such row in the panel
+         was the last one in its column and had nothing underneath to
+         collide with.
+
+         The same `height + 12` the other self-sizing rows use. ]==]
+    holder.advance = (w.height or 120) + 12
+
+    holder.offset = 0
+    holder.lines = {}
+    holder.removes = {}
+
+    local removable = type(w.remove) == "function"
+
+    --[[ A little more room per line when there are buttons on it. Twelve
+         pixels is a comfortable line of text and a poor click target, and the
+         rows without buttons should not pay for the ones with. ]]--
+    local lineHeight = removable and LINE_HEIGHT + 3 or LINE_HEIGHT
+
+    local rows = math.floor((w.height or 120) / lineHeight) - 1
+    if rows < 1 then rows = 1 end
+
+    for i = 1, rows do
+        local y = -6 - ((i - 1) * lineHeight)
+        local left = 8
+
+        if removable then
+            local b = CreateFrame("Button", nil, holder)
+
+            b:SetWidth(12)
+            b:SetHeight(12)
+            b:SetPoint("TOPLEFT", holder, "TOPLEFT", 6, y + 1)
+
+            b.label = OB.NewText(b, "OVERLAY", "GameFontNormalSmall")
+            b.label:SetPoint("CENTER", b, "CENTER", 0, 0)
+            b.label:SetText("-")
+            b.label:SetTextColor(0.75, 0.35, 0.35)
+
+            if OB.SkinButton then OB.SkinButton(b) end
+
+            --[[ The entry is put on the button by `Update` rather than closed
+                 over here. The rows are a fixed set of frames that a scrolled
+                 list moves different entries through, so a button that
+                 remembered what it was built with would remove the wrong
+                 name the moment somebody scrolled. ]]--
+            b:SetScript("OnClick", function()
+                if not this.entry then return end
+
+                pcall(w.remove, this.entry)
+
+                --[[ The whole panel, because a list like this is usually
+                     mirrored by a text box holding the same names, and leaving
+                     that showing the removed one is worse than not refreshing
+                     at all. `Update` after it in case there is no panel
+                     refresh to be had. ]]--
+                if OB.RefreshPanel then OB.RefreshPanel() end
+                holder:Update()
+            end)
+
+            b:SetScript("OnEnter", function()
+                this.label:SetTextColor(1, 0.4, 0.4)
+
+                if GameTooltip and this.entry then
+                    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+                    GameTooltip:SetText("Remove " .. this.entry)
+                    GameTooltip:Show()
+                end
+            end)
+
+            b:SetScript("OnLeave", function()
+                this.label:SetTextColor(0.75, 0.35, 0.35)
+                if GameTooltip then GameTooltip:Hide() end
+            end)
+
+            holder.removes[i] = b
+            left = 22
+        end
+
+        local text = OB.NewText(holder, "OVERLAY", "GameFontNormalSmall")
+        text:SetPoint("TOPLEFT", holder, "TOPLEFT", left, y)
+        text:SetJustifyH("LEFT")
+        holder.lines[i] = text
+    end
+
+    holder.Update = function(self)
+        local entries = {}
+
+        if type(w.provider) == "function" then
+            local ok, answer = pcall(w.provider)
+            if ok and type(answer) == "table" then entries = answer end
+        end
+
+        local total = table.getn(entries)
+        local shown = table.getn(self.lines)
+
+        --[[ Clamped on every refresh rather than only when scrolling: entries
+             can be removed while the box is scrolled to the bottom, and an
+             offset past the end shows a page of nothing. ]]--
+        local most = total - shown
+        if most < 0 then most = 0 end
+        if self.offset > most then self.offset = most end
+        if self.offset < 0 then self.offset = 0 end
+
+        for i = 1, shown do
+            local entry = entries[i + self.offset]
+            self.lines[i]:SetText(entry or "")
+
+            --[[ A button with no entry beside it is hidden rather than left
+                 showing. A row of minus signs against blank space reads as a
+                 list of things you could remove, and there is nothing
+                 there. ]]--
+            local button = self.removes[i]
+
+            if button then
+                button.entry = entry
+                if entry then button:Show() else button:Hide() end
+            end
+        end
+
+        --[[ Said once, in the box, when there is nothing in it. An empty box and
+             a broken box look identical otherwise. ]]--
+        if total == 0 and self.lines[1] then
+            self.lines[1]:SetText("|cff777777" .. (w.empty or "Nothing yet") .. "|r")
+        end
+
+        self.total = total
+    end
+
+    if holder.EnableMouseWheel then
+        holder:EnableMouseWheel(true)
+
+        holder:SetScript("OnMouseWheel", function()
+            local step = (arg1 and arg1 > 0) and -1 or 1
+            this.offset = (this.offset or 0) + step
+            this:Update()
+        end)
+    end
+
+    return holder
+end
+
 local function constructRow(page, w, column)
     local widget
 
@@ -1100,6 +1390,8 @@ local function constructRow(page, w, column)
         widget = addInput(page, w)
     elseif w.kind == "action" then
         widget = addAction(page, w)
+    elseif w.kind == "lines" then
+        widget = addLines(page, w)
     else
         widget = addDropDown(page, w)
     end
@@ -1159,60 +1451,174 @@ end
      The invariant that buys: **an update pass must run over a page before this
      does.** There is exactly one caller and it does both in order. ]]--
 function OB.LayoutPage(page)
-    local y = { 0, 0 }
+    local y = 0
+    local scroll = page.scroll or 0
 
     for i = 1, table.getn(page.rows) do
         local widget = page.rows[i]
-        local column = widget.column or 1
 
         if widget.visible and not widget.broken then
             local advance = widget.advance or ROW_ADVANCE[widget.kind] or 24
 
-            --[[ **A column that would overflow spills into the next one.**
+            --[==[ **Clipped here, because there is no frame doing it.**
 
-                 A page's rows are assigned a column when they are built, which
-                 is a guess made before anyone knows how many rows a class,
-                 a profile and a set of dependencies will actually show. The
-                 damage meter has seventeen settings and column one holds about
-                 twelve, so the rest were being drawn off the bottom of the
-                 panel where there is no way to reach them.
+                 `drawn` is where this row lands once the page has been moved. A
+                 row above the top or hanging past the bottom is hidden rather
+                 than drawn over the tab list or the status line -- which is the
+                 whole job a `ScrollFrame`'s rectangle would have done, and the
+                 only part of it this panel actually needed.
 
-                 Overflowing is better than clipping and far better than a
-                 scrollbar: 1.12's scroll frames are fiddly, and the page has a
-                 second column sitting right there. Rows keep their build order,
-                 so what lands in column two is the tail of column one rather
-                 than an arbitrary subset. ]]--
-            if column == 1 and (y[1] - advance) < -PAGE_H then column = 2 end
+                 **Anchored either way.** A hidden row still has a position, and
+                 the panel's own invariant is that every row the config says to
+                 show has one -- the self-test counts the ones that do not, and
+                 counted forty-two the first time this hid a row by returning
+                 before placing it.
 
-            --[[ Recorded, because `widget.column` is where the row was *asked*
-                 to go and this is where it ended up. Anything reasoning about
-                 the finished layout -- the self test, the overlap check -- has
-                 to read the second, or a spilled row looks like it jumped back
-                 up the page. ]]--
-            widget.placedColumn = column
+                 Whole rows only. Half a checkbox at the bottom edge is not worth
+                 the arithmetic to place and is worse to look at than the gap
+                 that replaces it; and because the range stops exactly where the
+                 last row ends, every row is still reachable. ]==]
+            local drawn = y + scroll
 
-            local x = 0
-            if column == 2 then x = COLUMN_X end
+            --[[ **Everything in one column, in the order it was written.**
+
+                 `widget.column` is still what the row asked for and is still
+                 recorded; nothing reads it to place anything any more. A row
+                 that asked for column two is now simply where it sits in the
+                 table, which for the appearance block is the end of the page --
+                 where it belongs and where it used to be, only downwards.
+
+                 `placedColumn` stays for the overlap check and the self test,
+                 which compare rows against their neighbours and need to know
+                 there is only one run of them. ]]--
+            widget.placedColumn = 1
 
             widget:ClearAllPoints()
             widget:SetPoint("TOPLEFT", page, "TOPLEFT",
-                    x + (widget.xoff or 0), y[column] + (widget.yoff or 0))
-            setShown(widget, true)
+                    (widget.xoff or 0), drawn + (widget.yoff or 0))
+
+            --[==[ **Unless it could never fit**, in which case it is drawn as
+                 soon as its top is on screen.
+
+                 "Whole rows only" is right for a control and wrong for a
+                 paragraph: a `lines` row measures its own height, and the font
+                 it measures at is a setting -- so a description that is two
+                 hundred pixels at ten point is past the height of the page at
+                 eighteen. Requiring it to fit would make it disappear entirely
+                 at the font size that made it big, which is the one moment
+                 somebody is looking at it.
+
+                 The tallest row in the panel today is two hundred and twelve
+                 against a page of four hundred and seventy-eight, so this
+                 protects nothing right now and costs one comparison. It is here
+                 because the alternative failure is silent. ]==]
+            local fits = drawn <= 0
+                    and ((drawn - advance) >= -PAGE_H or advance > PAGE_H)
+
+            setShown(widget, fits)
 
             --[[ `advance` is a row declaring its own height, and one kind has
                  to: a description wraps to four or five lines and the per-kind
                  figure is a single control's worth. Without it every row under
                  the paragraph is drawn on top of it. ]]--
-            y[column] = y[column] - advance
+            y = y - advance
         else
             setShown(widget, false)
         end
     end
+
+    OB.SizePage(page, -y)
+end
+
+--[==[ **How far the page can scroll, which is a fact about what it just drew.**
+
+     Recomputed here rather than once at build time because the answer changes
+     with every dependency: switching a bar off removes five rows and the page
+     gets shorter, and a scroll position that was valid a moment ago is now past
+     the end.
+
+     Nought when the rows fit, never negative: "there is nothing to scroll" and
+     "you may scroll upwards" are the same clamp, and only one of them is a page
+     anybody can read. ]==]
+function OB.SizePage(page, content)
+    if not page then return false end
+
+    local range = (content or 0) - PAGE_H
+    if range < 0 then range = 0 end
+
+    page.range = range
+
+    --[[ A page that has shortened under a scrolled position -- switching a bar
+         off removes five rows -- is pulled back to the new end. Written straight
+         to the field rather than through `ScrollPage`, which would lay the page
+         out again from inside its own layout. ]]--
+    if (page.scroll or 0) > range then page.scroll = range end
+
+    local bar = page.bar
+
+    if bar then
+        bar.syncing = true
+        bar:SetMinMaxValues(0, range)
+        bar:SetValue(page.scroll or 0)
+        bar.syncing = nil
+
+        --[[ Hidden when there is nothing to scroll, and never shown over a page
+             that is not itself on screen. A bar that cannot move is a control
+             that looks broken rather than a page that is finished. ]]--
+        if range > 0 and page:IsShown() then bar:Show() else bar:Hide() end
+    end
+
+    return true
+end
+
+--[==[ **Move a page and draw it there.**
+
+     Clamped here rather than at each caller: the wheel, the bar and the shrink
+     above all have the same two ends to fall off, and a page scrolled past its
+     last row is a blank panel with no indication which way is back. ]==]
+function OB.ScrollPage(page, to)
+    if not page then return false end
+
+    local range = page.range or 0
+
+    to = tonumber(to) or 0
+    if to < 0 then to = 0 end
+    if to > range then to = range end
+
+    if to == (page.scroll or 0) then return false end
+
+    page.scroll = to
+    OB.LayoutPage(page)
+
+    return true
 end
 
 -- ---------------------------------------------------------------------------
 -- page contents
 -- ---------------------------------------------------------------------------
+
+--[==[ **The edit-mode settings belong beside the edit-mode button.**
+
+     They were under Movement on General while the button that turns edit mode on
+     was on Home -- and a second copy of that button was on General as well, so
+     the same action sat on two pages and the four switches that describe how it
+     behaves sat with neither.
+
+     All four are about the same thing: whether bars can be dragged, what unlocks
+     them, and what they snap to while they are being dragged. On Home under the
+     button they explain it; on General they were four unrelated-looking switches
+     between Visibility and Feedback.
+
+     A table of their own rather than lines in `buildHomePage`, so they are
+     indexed for the slash prompt and swept by the caption checks exactly as
+     every other row is. A hand-written widget on a hand-built page is invisible
+     to both. ]==]
+local editModeRows = {
+    { "Lock Bars", "locked", "boolean" },
+    { "Alignment Grid", "grid", "boolean" },
+    { "Grid Spacing", "gridSize", "slider", OB.GRID_MIN, OB.GRID_MAX, 2,
+      nil, nil, "!grid" },
+}
 
 local generalLeft = {
     { "Visibility", "__h_vis", "header" },
@@ -1226,7 +1632,6 @@ local generalLeft = {
     { "Hide When Stealthed", "hideStealth", "boolean", nil, nil, nil, nil, nil, "!show" },
     { "Hide While Dead", "hideDead", "boolean", nil, nil, nil, nil, nil, "!show" },
     { "Movement", "__h_move", "header" },
-    { "Lock Bars", "locked", "boolean" },
     { "Move Bars Together", "join", "boolean" },
     { "Allow Bar Overlap", "allowOverlap", "boolean" },
     { "Feedback", "__h_fb", "header" },
@@ -1241,7 +1646,8 @@ local generalRight = {
     { "Bar Texture", "texture", OB.textures, 150 },
     { "Bar Border", "border", OB.borders, 150 },
     { "Font", "font", OB.fonts, 150 },
-    { "Font Outline", "fontOutline", "boolean" },
+    { "Font Outline", "fontOutline", OB.fontOutlines, 150 },
+    { "Drag Camera Over Frames", "cameraDrag", "boolean" },
 
     --[[ There is no global Font Size row, and that is deliberate rather than an
          oversight. Every bar sets its own Text Size and always wins -- StyleBar
@@ -1332,6 +1738,7 @@ end
 
 indexRows(generalLeft, "global", nil, OB.optionIndex.global)
 indexRows(generalRight, "global", nil, OB.optionIndex.global)
+indexRows(editModeRows, "global", nil, OB.optionIndex.global)
 
 --[[ The general rows as one list, which the index cannot stand in for: the index
      is keyed by setting and drops the decorative ones, so it can answer "does
@@ -1345,6 +1752,13 @@ end
 
 for i = 1, table.getn(generalRight) do
     table.insert(OB.generalOptions, generalRight[i])
+end
+
+--[[ Home's rows are general rows too. They are drawn on another page; every
+     sweep that reads this list -- the duplicate check, the caption rules -- is
+     asking about the settings rather than about where they are drawn. ]]--
+for i = 1, table.getn(editModeRows) do
+    table.insert(OB.generalOptions, editModeRows[i])
 end
 
 indexRows(slotGeometry, "slot", nil, OB.optionIndex.slot)
@@ -1521,18 +1935,91 @@ local function tabModules(entry)
     return { entry }
 end
 
+--[[ **The rows a tab shows, which are not always the module's whole list.**
+
+     A tab entry may name a frame -- `{ "unitframes", label = "Player Frame",
+     frame = "player" }` -- and then its rows come from the module's own
+     generator for that frame rather than from its shared list. One module, five
+     pages, and the settings that describe a single frame live on the page named
+     after it.
+
+     Everything else is unchanged: a plain entry is a module id and its rows are
+     `options`, which is every tab that existed before this. ]]--
+local function tabRows(entry, m)
+    if not m then return {} end
+
+    if type(entry) == "table" and entry.frame and m.frameOptions then
+        return m.frameOptions(entry.frame, entry.label or entry.frame)
+    end
+
+    return m.options or {}
+end
+
+--[[ A tab named by its entry where it says so, and by its module otherwise. ]]--
+--[[ A page's own header key. Several tabs may be backed by one module, and a
+     key shared between them is one row built on two pages -- which the panel
+     checks for and which was exactly what happened when the frame tabs
+     arrived. ]]--
+local function tabHeaderKey(entry, id)
+    if type(entry) == "table" and entry.frame then
+        return "__h_" .. id .. "_" .. entry.frame
+    end
+    return "__h_" .. id
+end
+
+local function tabLabel(entry, m)
+    if type(entry) == "table" and entry.label then return entry.label end
+    return m and m.name
+end
+
 local function sectionItems(entry)
     local ids = tabModules(entry)
     local out = {}
 
+    --[[ **Some top-level categories are a home for several whole modules.**
+
+         Party Frames and Raid Frames are one settings area, but they are not one
+         implementation: one restyles Blizzard's party widgets and the other
+         creates ECO's raid grid. `moduleTabs` says the second column should pick
+         between those modules themselves rather than between the section markers
+         inside each module's option list. The markers are still useful as visual
+         headings on the selected module page; they just are not another level of
+         navigation. ]]--
+    if type(entry) == "table" and entry.moduleTabs then
+        for k = 1, table.getn(ids) do
+            local m = OB.modules[ids[k]]
+            if m then
+                table.insert(out, { value = ids[k], caption = m.name })
+            end
+        end
+        return out
+    end
+
     for k = 1, table.getn(ids) do
         local m = OB.modules[ids[k]]
 
-        for i = 1, table.getn((m and m.options) or {}) do
-            local opt = m.options[i]
+        local rows = tabRows(entry, m)
 
+        for i = 1, table.getn(rows) do
+            local opt = rows[i]
+
+            --[[ **A marker that re-opens a section is a group, not a new tab.**
+
+                 One section's rows do not have to be contiguous: the main action
+                 bar's sliders come first, then Hide Elements gets a section of
+                 its own, and then the two move-the-bars buttons go back under
+                 Main Bar. Listing every marker put "Main Bar" in the tab list
+                 twice, both entries selecting the same thing. ]]--
             if opt[3] == "section" then
-                table.insert(out, { value = opt[4], caption = opt[1] })
+                local already = false
+
+                for s = 1, table.getn(out) do
+                    if out[s].value == opt[4] then already = true end
+                end
+
+                if not already then
+                    table.insert(out, { value = opt[4], caption = opt[1] })
+                end
             end
         end
     end
@@ -1547,9 +2034,18 @@ local function sectionSubItems(entry)
     --[[ Keyed by the tab's own module, which is the first of them -- so a page
          built from two modules has one selected section rather than two that
          disagree. ]]--
-    local moduleId = tabModules(entry)[1]
+    local ids = tabModules(entry)
+    local moduleId = ids[1]
 
     return function()
+        -- A module-tab page opens on its first module, not on that module's first
+        -- internal section marker. Seed the selection before row visibility is
+        -- evaluated so the first refresh cannot briefly show the wrong rows.
+        if type(entry) == "table" and entry.moduleTabs
+                and not OB.panel.section[moduleId] then
+            OB.panel.section[moduleId] = ids[1]
+        end
+
         return sectionItems(entry), OB.SelectedSection(moduleId),
                 function(value)
                     OB.panel.section[moduleId] = value
@@ -1631,12 +2127,25 @@ local function selectCategory(name)
 
     for i = 1, table.getn(panel.categories) do
         local cat = panel.categories[i]
-        if cat.name == name then
-            cat.page:Show()
+        --[==[ Selection is a gold bar down the leading edge, not a filled
+             row: a filled row competes with the page beside it. Hover is drawn
+             differently again, because where the cursor is and where you are
+             are two different facts. ]==]
+        local on = (cat.name == name)
+
+        if on then cat.page:Show() else cat.page:Hide() end
+
+        --[[ The bar is a sibling, so it does not follow the page on its own.
+             Hidden with it either way; `LayoutPage` decides whether a shown page
+             gets one. ]]--
+        if cat.page.bar and not on then cat.page.bar:Hide() end
+
+        if OB.SkinTabState then
+            OB.SkinTabState(cat.button, cat.label, on)
+        elseif on then
             cat.button:LockHighlight()
             cat.label:SetTextColor(1, 0.82, 0)
         else
-            cat.page:Hide()
             cat.button:UnlockHighlight()
             cat.label:SetTextColor(0.7, 0.7, 0.7)
         end
@@ -1649,9 +2158,43 @@ end
 -- exposed so the tests can drive the navigation the way a click does
 OB.SelectCategory = selectCategory
 
+--[[ Which one is in front. `panel.selected` is a name; everything that wants to
+     act on the page behind it wants the entry. ]]--
+function OB.SelectedCategory()
+    local panel = OB.settings
+    if not panel or not panel.selected then return nil end
+
+    for i = 1, table.getn(panel.categories) do
+        if panel.categories[i].name == panel.selected then
+            return panel.categories[i]
+        end
+    end
+
+    return nil
+end
+
 local function addCategory(panel, name)
     local index = table.getn(panel.categories) + 1
 
+    --[==[ **No `ScrollFrame`.** The page is a direct child of the panel again,
+         exactly as it was, and the scrolling is done by moving where its rows
+         are drawn.
+
+         The `ScrollFrame` version hid the entire interface. Which of its
+         requirements a 1.12 client did not meet is not worth another guess --
+         `SetScrollChild`, the child's anchoring and the clipping rectangle are
+         three separate pieces of engine behaviour, all of them invisible to a
+         harness that models frames as tables, and getting any one of them wrong
+         draws a page of controls nowhere with nothing to say so.
+
+         What is left uses `SetPoint`, `Show` and `Hide` -- the three calls this
+         panel has been built out of since it existed and the three that cannot
+         be subtly wrong. `LayoutPage` already computes every row's position, so
+         offsetting them is one addition; and it already decides which rows are
+         drawn, so clipping is one more condition on a decision it was making
+         anyway. A `ScrollFrame` would have done the clipping in the engine. This
+         does it in the layout, which is where this panel does everything
+         else. ]==]
     local page = CreateFrame("Frame", nil, panel)
     page:SetPoint("TOPLEFT", panel, CONTENT_X, CONTENT_Y)
     page:SetWidth(PAGE_W)
@@ -1659,18 +2202,73 @@ local function addCategory(panel, name)
     page:Hide()
     page.rows = {}
 
+    --[[ How far down the page has been moved, in pixels, always at least
+         nought. Kept on the page so every section remembers its own place. ]]--
+    page.scroll = 0
+    page.range = 0
+
+    --[==[ **A flat bar in the twenty pixel margin `PAGE_W` already left**, so it
+         costs the page nothing: no row had to be narrowed and the note widths
+         still measure against the same number.
+
+         A sibling of the page rather than a child, so that hiding a page does
+         not have to remember to hide its bar as a separate act -- `LayoutPage`
+         is what shows and hides it, from the range it just computed. ]==]
+    local bar = CreateFrame("Slider", nil, panel)
+    bar:SetWidth(SCROLL_W)
+    bar:SetPoint("TOPLEFT", page, "TOPRIGHT", 5, 0)
+    bar:SetPoint("BOTTOMLEFT", page, "BOTTOMRIGHT", 5, 0)
+    bar:SetOrientation("VERTICAL")
+    bar:SetMinMaxValues(0, 0)
+    bar:SetValueStep(1)
+    bar:SetValue(0)
+    bar:Hide()
+
+    local track = OB.SkinFill(bar, "BACKGROUND", { 1, 1, 1, 0.06 })
+    if track then track:SetAllPoints(bar) end
+
+    if bar.SetThumbTexture then
+        bar:SetThumbTexture("Interface\\Buttons\\WHITE8X8")
+
+        local thumb = bar.GetThumbTexture and bar:GetThumbTexture()
+
+        if thumb then
+            thumb:SetWidth(SCROLL_W)
+            thumb:SetHeight(48)
+            thumb:SetVertexColor(1, 0.82, 0, 0.5)
+        end
+    end
+
+    --[[ `syncing` is the same guard the option sliders use: `LayoutPage` moves
+         the bar to follow the page, and without it that move would scroll the
+         page to where it already is. ]]--
+    bar:SetScript("OnValueChanged", function()
+        if this.syncing then return end
+        OB.ScrollPage(page, this:GetValue() or 0)
+    end)
+
+    page.bar = bar
+
     local button = CreateFrame("Button", nil, panel)
     button:SetWidth(SIDEBAR_W)
     button:SetHeight(22)
     button:SetPoint("TOPLEFT", panel, 18, CONTENT_Y + 4 - (index - 1) * 24)
-    button:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
-
     -- a bare Button has no font string of its own in 1.12, so build one
     local label = OB.NewText(button, "OVERLAY", "GameFontNormalSmall")
     label:SetPoint("LEFT", button, 6, 0)
     label:SetJustifyH("LEFT")
     label:SetText(name)
     button:SetFontString(label)
+
+    --[==[ The quest-log highlight goes with it: that texture is a gradient with
+         the quest log's proportions baked in, and it was being stretched across
+         a button a third as wide. Without the skin the button keeps it, which is
+         what it always had. ]==]
+    if OB.SkinTab then
+        OB.SkinTab(button, label)
+    else
+        button:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+    end
 
     button:SetScript("OnClick", function() selectCategory(name) end)
 
@@ -1752,7 +2350,11 @@ local function buildBarsPage(page)
         local m = OB.modules[id]
 
         if m.options and not m.feature then
-            buildRow(page, describeRow({ m.name, "__h_" .. id, "header" },
+            --[[ No tab entry here: this page is not one of `OB.featureTabs`,
+                 so the label is the module's own name and the header key its
+                 plain form. Spelled as nil rather than left to a global that
+                 happened not to exist. ]]--
+            buildRow(page, describeRow({ tabLabel(nil, m), tabHeaderKey(nil, id), "header" },
                     "global", id), 2)
 
             for r = 1, table.getn(m.options) do
@@ -1795,11 +2397,64 @@ end
 --[[ Exported, because two things outside this file need it: the self test, which
      checks that every feature module is reachable, and the login check that says
      so out loud when one is not. ]]--
+--[==[ **Ordered the way somebody reaches for them**, which is roughly the
+     screen from the outside in: the bars along the bottom, the frames around
+     the units, the readouts beside them, then the pages that are about
+     information rather than about pixels, and automation last because it is the
+     only one that does something without being looked at.
+
+     Not load order. That is a dependency graph -- the parser has to load before
+     the meters that read it -- and nobody looking for the damage meter thinks
+     about what it depends on. ]==]
 OB.featureTabs = {
-    "actionbars", "unitframes", "nameplates",
+    "actionbars",
+    "unitframes",
+    "nameplates",
+
+    --[==[ Party and raid frames are one navigation entry with two second-column
+         pages. They remain separate modules so each keeps its own enable flag,
+         events and storage, and their settings never reach each other -- a raid
+         grid and a party row are the same idea at two sizes, not one table.
+
+         Labelled "Party Frames" because that is what somebody is looking for.
+         Raid is the second page inside it. ]==]
+    { "partyframes", "raidframes", label = "Party Frames", moduleTabs = true },
+
+    "buffframes",
+
+    --[==[ Not a module, and the one hand-built page in this list. Health,
+         resource, combo points, druid mana and the swing timers are bars of
+         their own -- not unit frames and not action bars -- and they had no
+         entry here at all until recently.
+
+         Named for what they are rather than for what kind of thing they are. A
+         heads-up display is a category; Omni Bars is the name somebody uses when
+         they mean these. ]==]
+    { hand = "Omni Bars" },
+
     "damage", "threat",
-    "unitscan", "itemdatabase", "tooltip", "waypoints",
-    { "chat", "roster" }, "map", "qol",
+    "unitscan",
+    "tooltip",
+    "characterpanel",
+    "bags",
+
+    --[==[ **Two modules, one tab, and the sections stay the navigation.**
+
+         `moduleTabs` is what Party and Raid need: two implementations of the
+         same idea, each wanting its own page. Chat is the opposite shape -- one
+         subsystem with a dozen areas -- and setting the flag here replaced its
+         whole second column with the word "Chat", burying Timestamps, Mentions,
+         Channel Names, Links, Copying and Popups on a single page with no way to
+         reach them.
+
+         Without the flag the column is built from every section marker in both
+         modules, which is what it has always been: the roster's own sections
+         simply appear at the end of Chat's. ]==]
+    { "chat", "roster", label = "Chat" },
+
+    "map", "waypoints",
+    "auction", "itemdatabase",
+    "qol",
 }
 
 --[[ One subsystem's whole page: what it is, whether it is on, and its settings.
@@ -1814,12 +2469,13 @@ OB.featureTabs = {
 local function featurePage(entry)
     local ids = tabModules(entry)
     local id = ids[1]
+    local moduleTabs = type(entry) == "table" and entry.moduleTabs
 
     return function(page)
         local m = OB.modules[id]
         if not m then return end
 
-        buildRow(page, describeRow({ m.name, "__h_" .. id, "header" },
+        buildRow(page, describeRow({ tabLabel(entry, m), tabHeaderKey(entry, id), "header" },
                 "global", nil), 1)
 
         --[[ The description, and for a subsystem that is not written yet it is
@@ -1836,7 +2492,7 @@ local function featurePage(entry)
         if m.description and m.development then
             local note = OB.NewText(page, "OVERLAY", "GameFontDisableSmall")
             note:SetJustifyH("LEFT")
-            note:SetWidth(COLUMN_X - 24)
+            note:SetWidth(PAGE_W - 24)
             note:SetText(m.description)
 
             local holder = CreateFrame("Frame", nil, page)
@@ -1881,6 +2537,65 @@ local function featurePage(entry)
              difference was not worth having. Enable is the one that means
              something, and it is where the list of subsystems is. ]]--
 
+        --[[ **A page whose subsystem is switched off says so.**
+
+             Twelve subsystems ship off, and every one of them has a full page of
+             live-looking controls that quietly do nothing until it is switched
+             on. Somebody changes Map Size, nothing happens, changes it again,
+             nothing happens -- and reports that the map settings do not work,
+             which is exactly what it looks like from there.
+
+             The Show checkbox that used to sit on each page was removed on the
+             grounds that two switches for one subsystem is one too many, and
+             that is right. This is not a second switch. It is the sentence that
+             was missing when the first one was taken away: the page saying
+             where its own on-switch lives.
+
+             Shown only while the subsystem is off, so a page that works is not
+             carrying a paragraph about a state it is not in. ]]--
+        if not moduleTabs then
+            local off = OB.NewText(page, "OVERLAY", "GameFontNormalSmall")
+            off:SetJustifyH("LEFT")
+            off:SetWidth(PAGE_W - 24)
+            off:SetTextColor(1, 0.82, 0)
+
+            local offHolder = CreateFrame("Frame", nil, page)
+            offHolder:SetWidth(1)
+            offHolder:SetHeight(1)
+            offHolder.label = off
+
+            offHolder.Update = function(self)
+                if OB.ModuleEnabled(id) then
+                    self.label:SetText("")
+                    self.advance = 0
+                    self.label:Hide()
+                    return
+                end
+
+                self.label:Show()
+                self.label:SetText(m.name .. " is switched off. Nothing on this "
+                        .. "page changes anything until it is switched on, under "
+                        .. "Subsystems.")
+
+                --[[ Measured rather than guessed, and on update rather than at
+                     build time: a font string has no font until `ApplyFont` reaches
+                     it, and asking a fontless one for its height throws on 1.12. ]]--
+                local ok, height = pcall(self.label.GetStringHeight, self.label)
+                if not ok or not height or height < 12 then height = 12 end
+
+                self.advance = height + 12
+            end
+
+            --[[ **On the page only while the subsystem is off**, said the way every
+                 other conditional row says it. A row that is always placed and
+                 merely empties itself still occupies a position in the column, and
+                 the row after it then sits at the same height -- which is the
+                 overlap the layout is built to prevent. Hidden rows are skipped
+                 entirely, so there is nothing to occupy. ]]--
+            place(page, offHolder, { kind = "button", key = "", scope = "global",
+                    module = id, dependsOn = "@module_off" }, 1)
+        end
+
         --[[ A section marker is not built; it stamps every row after it, so the
              second column can show one group at a time. A module that declares
              none leaves every row unstamped and its page is one list, exactly as
@@ -1895,11 +2610,48 @@ local function featurePage(entry)
 
         for k = 1, table.getn(ids) do
             local owner = OB.modules[ids[k]]
+            local ownerId = ids[k]
 
-            for r = 1, table.getn((owner and owner.options) or {}) do
-                local w = describeRow(owner.options[r], "module", ids[k])
+            -- A combined category can contain modules with independent enable
+            -- switches. Say which selected page is off instead of showing the
+            -- first module's warning on both pages.
+            if moduleTabs and owner then
+                buildRow(page, {
+                    caption = owner.name .. " is switched off - enable it under Subsystems.",
+                    key = "__h_off_" .. ownerId,
+                    scope = "global",
+                    module = ownerId,
+                    kind = "header",
+                    dependsOn = "@module_off",
+                    section = ownerId,
+                    sectionOf = id,
+                }, 1)
+            end
 
-                if w.kind == "section" then
+            local ownRows = tabRows(entry, owner)
+
+            for r = 1, table.getn(ownRows) do
+                local w = describeRow(ownRows[r], "module", ownerId)
+
+                if moduleTabs then
+                    -- Existing section markers become headings *inside* the
+                    -- Party Frames / Raid Frames page. The second column is
+                    -- already being used to choose the module, so exposing the
+                    -- markers there would create an unwanted third level.
+                    if w.kind == "section" then
+                        column = 1
+                        w.kind = "header"
+                        w.section = ownerId
+                        w.sectionOf = id
+                        buildRow(page, w, column)
+                    elseif w.kind == "column" then
+                        column = w.column
+                    else
+                        w.section = ownerId
+                        w.sectionOf = id
+                        buildRow(page, w, column)
+                    end
+                elseif w.kind == "section" then
                     section = w.section
 
                     --[[ A new section starts on the left again. Carrying the
@@ -1938,10 +2690,47 @@ local function featurePage(entry)
              they draw into the client's frames, and all three use the shared
              look. There is no property of a module that implies this, so it is
              stated. ]]--
-        if m.styled then
-            local look = OB.LookOptions()
+        --[[ **Once per module, not once per page.**
+
+             A module may now back several tabs -- the unit frames have one
+             per frame -- and the shared look is the module's, not each
+             page's. Built on every one of them, the same five rows appeared
+             five times, all writing the same setting, and the duplicate-row
+             check said so in exactly those words.
+
+             It belongs on the page the module is named after. ]]--
+        if moduleTabs then
+            -- Preserve each module's own shared appearance block on its own
+            -- second-column page. In this group Raid Frames is styled while
+            -- Party Frames intentionally is not.
+            for k = 1, table.getn(ids) do
+                local ownerId = ids[k]
+                local owner = OB.modules[ownerId]
+                if owner and owner.styled then
+                    local look = OB.LookOptions(owner.styled)
+                    for r = 1, table.getn(look) do
+                        local w = describeRow(look[r], "module", ownerId)
+                        w.section = ownerId
+                        w.sectionOf = id
+                        buildRow(page, w, 2)
+                    end
+                end
+            end
+        elseif m.styled and not (type(entry) == "table" and entry.frame) then
+            local look = OB.LookOptions(m.styled)
             for r = 1, table.getn(look) do
-                buildRow(page, describeRow(look[r], "module", id), 2)
+                local w = describeRow(look[r], "module", id)
+
+                -- A module whose page has internal sections can say where the
+                -- shared Appearance block belongs. UnitFrames keeps it under
+                -- General so Bar Texture/Font do not bleed into every frame
+                -- page merely because those rows are appended by the shell.
+                if m.appearanceSection then
+                    w.section = m.appearanceSection
+                    w.sectionOf = id
+                end
+
+                buildRow(page, w, 2)
             end
         end
     end
@@ -1977,6 +2766,23 @@ local function buildModulesPage(page)
 
             if check then
                 check.alwaysShow = true
+
+                --[==[ **A size up, because this page is a list of names.**
+
+                     Every other page is settings, where the caption is a
+                     sentence fragment competing for a 210 pixel column and the
+                     small face is what keeps it on one line. Here each caption
+                     is a subsystem name -- two words, no competition -- and at
+                     the same small size a page of nothing but names reads as
+                     fine print.
+
+                     Scoped to this page rather than raised everywhere: the
+                     width those captions are cut to is tuned against the second
+                     column, and a larger face on a long caption runs under
+                     it. ]==]
+                if check.label and check.label.SetFontObject then
+                    check.label:SetFontObject(GameFontNormal)
+                end
 
                 check.Update = function(self)
                     local flag = OB.profile.modulesEnabled[id]
@@ -2033,6 +2839,126 @@ local function buildModulesPage(page)
 end
 
 
+
+--[==[ **Home: the two modes, and three facts.**
+
+     The panel opens here, so it has one job -- get somebody to the thing they
+     came for -- and one temptation, which is to become another settings page.
+     It is not one. There is nothing on it to configure.
+
+     Test Mode and Edit Mode are the two things that change how the whole
+     interface behaves rather than how one part of it looks, so they are the two
+     buttons. Everything else here is read-only: which profile is being edited,
+     how many subsystems are on, and what this client can do that a stock 1.12
+     client cannot. ]==]
+local function buildHomePage(page)
+    local row = 1
+
+    --[==[ Through `describeRow` like every other page. A hand-written widget
+         table looks like it ought to work and is missing the fields the shared
+         machinery fills in -- `scope` first among them, which is what decides
+         where a row reads its value from. Home's rows read nothing, but the
+         machinery does not know that until it is told. ]==]
+    local function add(opt)
+        local widget = buildRow(page, describeRow(opt, "global", nil), 1)
+        row = row + 1
+        return widget
+    end
+
+    --[==[ A status line rather than a control. `header` rows are text and
+         nothing else, which is exactly what these are -- but their `Update` is a
+         no-op, so each is given one that answers the question fresh every time
+         the page is shown. ]==]
+    local function status(fn, gold)
+        local w = add({ "", "__home_" .. row, "header" })
+        if not w then return end
+
+        if not gold and w.label and w.label.SetTextColor then
+            w.label:SetTextColor(0.85, 0.85, 0.85)
+        end
+
+        w.Update = function(self)
+            if self.label then self.label:SetText(fn() or "") end
+        end
+
+        w:Update()
+        return w
+    end
+
+    add({ "Modes", "__home_modes", "header" })
+
+    --[==[ The label is the state. A button reading "Test Mode" while test mode
+         is running is a button that lies about what pressing it does. ]==]
+    add({ "Test Mode", "__home_test", "action",
+        function() OB.ToggleTestMode() end,
+        function()
+            if OB.testMode then return "Stop Test Mode" end
+            return "Test Mode"
+        end })
+
+    add({ "Edit Mode", "__home_edit", "action",
+        function() OB.ToggleEditMode() end,
+        function()
+            if OB.EditMode and OB.EditMode() then return "Done Editing" end
+            return "Edit Mode"
+        end })
+
+    --[[ The switches that say how edit mode behaves, under the button that
+         turns it on. See `editModeRows`. ]]--
+    for i = 1, table.getn(editModeRows) do
+        add(editModeRows[i])
+    end
+
+    add({ "This Interface", "__home_state", "header" })
+
+    status(function()
+        return "Profile:  " .. tostring(OB.profileName or "?")
+    end)
+
+    status(function()
+        local on, total = 0, 0
+
+        for i = 1, table.getn(OB.moduleOrder or {}) do
+            local m = OB.modules[OB.moduleOrder[i]]
+
+            if m and m.feature and not m.development then
+                total = total + 1
+                local flag = OB.profile and OB.profile.modulesEnabled[OB.moduleOrder[i]]
+                if flag == nil or flag then on = on + 1 end
+            end
+        end
+
+        return "Modules on:  " .. on .. " of " .. total
+    end)
+
+    --[==[ **Informational, and deliberately not configurable.**
+
+         There is nothing to set here: an extension is loaded or it is not, and
+         the addon's job is to use what is there rather than to ask anybody about
+         it. It earns a place on Home only because "why does my target show a
+         percentage instead of a number" is otherwise unanswerable from inside
+         the interface.
+
+         What is missing is named by what the player loses rather than by the DLL
+         they lack. "UnitXP not detected" is a fact about their install;
+         "precise distance unavailable" is a fact about their interface, and only
+         the second tells them whether they care. ]==]
+    add({ "Client Enhancements", "__home_caps", "header" })
+
+    for i = 1, table.getn(OB.enhancements or {}) do
+        local entry = OB.enhancements[i]
+
+        status(function()
+            if OB.EnhancementActive(entry.key) then
+                return "|cff55ff55+|r  " .. entry.name
+            end
+
+            local loss = OB.enhancementLoss and OB.enhancementLoss[entry.key]
+            return "|cff888888-  " .. entry.name
+                    .. (loss and ("  (" .. loss .. ")") or "") .. "|r"
+        end)
+    end
+end
 
 local function buildProfilesPage(page)
     buildRow(page, describeRow({ "Profile", "__h_profile", "header" },
@@ -2134,20 +3060,51 @@ function OB.CreateSettingsPanel()
     panel:SetWidth(PANEL_W)
     panel:SetHeight(PANEL_H)
     panel:SetPoint("CENTER", UIParent, "CENTER", 0, 32)
-    panel:SetBackdrop({
-        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        insets = { left = 11, right = 12, top = 12, bottom = 11 },
-    })
-    panel:SetBackdropColor(0, 0, 0, 1)
-    panel:SetBackdropBorderColor(0.2, 0.2, 0.2)
+    --[==[ **The addon's own chrome, when it is there.**
+
+         This was `UI-DialogBox-Border` around `UI-Tooltip-Background`, which is
+         the client's window art: the panel looked like Blizzard's options with
+         somebody else's settings inside it. See `skin.lua`.
+
+         **Guarded, because a new file is not loaded until the client restarts.**
+         The game reads an addon's file list once at startup, so a `/reload`
+         after a file is added re-runs the old list and the new file is simply
+         not there. Calling into it unguarded turns "the skin is missing" into
+         "there is no settings panel", which is the difference between a plain
+         window and no way to change anything.
+
+         The old chrome is the fallback rather than nothing, so the panel is
+         always a window somebody can read. ]==]
+    if OB.SkinPanel then
+        OB.SkinPanel(panel)
+    else
+        panel:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            insets = { left = 11, right = 12, top = 12, bottom = 11 },
+        })
+        panel:SetBackdropColor(0, 0, 0, 1)
+        panel:SetBackdropBorderColor(0.2, 0.2, 0.2)
+    end
     panel:SetMovable(true)
     panel:EnableMouse(true)
     panel:SetClampedToScreen(true)
     panel:RegisterForDrag("LeftButton")
     panel:SetScript("OnDragStart", function() panel:StartMoving() end)
     panel:SetScript("OnDragStop", function() panel:StopMovingOrSizing() end)
-    panel:SetFrameStrata("DIALOG")
+--[==[ **Above the edit-mode handles, which is where the settings for them are.**
+
+     The panel sat in `DIALOG`; edit mode raises every drag handle to
+     `FULLSCREEN_DIALOG` so the handle covers whatever it is moving. That is one
+     layer higher, so turning edit mode on buried the window holding the switch
+     that turns it off.
+
+     Same strata as the handles rather than a higher one -- `TOOLTIP` is the next
+     layer up and belongs to tooltips. Within one strata the order is frame
+     level, and the panel takes a level well above anything the handles use, so
+     it stays on top without leaving the layer it belongs in. ]==]
+    panel:SetFrameStrata("FULLSCREEN_DIALOG")
+    if panel.SetFrameLevel then panel:SetFrameLevel(100) end
 
     --[[ The panel is in UISpecialFrames, so ESC hides it without ever calling
          the toggle. Anything that has to happen on close belongs here, or an ESC
@@ -2163,16 +3120,25 @@ function OB.CreateSettingsPanel()
     panel.btnClose:SetPoint("TOPRIGHT", -6, -6)
     panel.btnClose:SetScript("OnClick", function() panel:Hide() end)
 
+    --[==[ **A title and a rule under it**, rather than a carved plaque hanging
+         off the top edge. `UI-DialogBox-Header` is a picture of a stone tablet
+         with a fixed width, so the title was centred on the tablet rather than
+         on the panel, and the tablet overhung the frame it belonged to. ]==]
     panel.header = panel:CreateTexture(nil, "ARTWORK")
-    panel.header:SetWidth(340)
-    panel.header:SetHeight(64)
-    panel.header:SetPoint("TOP", panel, 0, 12)
-    panel.header:SetTexture("Interface\\DialogFrame\\UI-DialogBox-Header")
-    panel.header:SetVertexColor(0.2, 0.2, 0.2)
+    panel.header:SetWidth(1)
+    panel.header:SetHeight(1)
+    panel.header:SetPoint("TOP", panel, 0, 0)
 
     panel.caption = OB.NewText(panel, "ARTWORK", "GameFontNormal")
-    panel.caption:SetPoint("TOP", panel.header, 0, -14)
+    panel.caption:SetPoint("TOP", panel, 0, -16)
     panel.caption:SetText(OB.addonName)
+    panel.caption:SetTextColor(1, 0.82, 0)
+
+    if OB.SkinRule then
+        panel.titleRule = OB.SkinRule(panel, OB.skin and OB.skin.rule)
+        panel.titleRule:SetPoint("TOPLEFT", panel, 16, -38)
+        panel.titleRule:SetPoint("TOPRIGHT", panel, -16, -38)
+    end
 
     panel.divider = panel:CreateTexture(nil, "ARTWORK")
     panel.divider:SetTexture(1, 1, 1, 0.12)
@@ -2192,16 +3158,34 @@ function OB.CreateSettingsPanel()
          The four subsystem pages are built from the module registry rather than
          hand-written, so a module added later gets a tab by registering, and a
          tab cannot drift out of step with the module it configures. ]]--
-    buildPage("Profiles", buildProfilesPage, addCategory(panel, "Profiles"))
+--[==[ **Home, then the two pages that decide what everything else means.**
 
-    --[[ No General tab. Its rows are the first entry in the Bars column now,
-         because scale, texture, font, border and the movement switches are all
-         settings *about the bars* -- reading them from a page of their own meant
-         leaving the one place you could see what they did. ]]--
-    buildPage("OmniBars", buildBarsPage, addCategory(panel, "OmniBars"))
+     Home is first because it is where the panel opens and because the two modes
+     that change how the whole interface behaves live on it. Modules answers
+     "which of these do I want at all" and Profiles answers "which set of answers
+     am I editing" -- both are above the settings rather than among them, and
+     both are short.
+
+     Everything after them is one subsystem per entry, in the order of
+     `OB.featureTabs`. ]==]
+    buildPage("Home", buildHomePage, addCategory(panel, "Home"))
+    buildPage("Modules", buildModulesPage, addCategory(panel, "Modules"))
+    buildPage("Profiles", buildProfilesPage, addCategory(panel, "Profiles"))
 
     for i = 1, table.getn(OB.featureTabs) do
         local entry = OB.featureTabs[i]
+
+        --[==[ A hand-built page rather than a module's option list. Placed from
+             this list so its position among the subsystems is decided in one
+             place with all the others, instead of being emitted before the loop
+             and therefore always first. ]==]
+        if type(entry) == "table" and entry.hand then
+            if entry.hand == "Omni Bars" then
+                subItems["Omni Bars"] = subItems.OmniBars
+                buildPage("Omni Bars", buildBarsPage, addCategory(panel, "Omni Bars"))
+            end
+        else
+
         local id = tabModules(entry)[1]
         local m = OB.modules[id]
 
@@ -2226,20 +3210,22 @@ function OB.CreateSettingsPanel()
                  adds the column entry, and removing the last one removes the
                  column. ]]--
             if table.getn(sectionItems(entry)) > 0 then
-                subItems[m.name] = sectionSubItems(entry)
+                subItems[tabLabel(entry, m)] = sectionSubItems(entry)
             end
 
-            buildPage(m.name, featurePage(entry), addCategory(panel, m.name))
+            local label = tabLabel(entry, m)
+            buildPage(label, featurePage(entry), addCategory(panel, label))
+        end
+
         end
     end
 
-    buildPage("Modules", buildModulesPage, addCategory(panel, "Modules"))
+--[==[ **Test mode is on Home now, and was in two places for a while.**
 
-    panel.btnTest = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    panel.btnTest:SetWidth(120)
-    panel.btnTest:SetHeight(20)
-    panel.btnTest:SetPoint("BOTTOMLEFT", panel, 25, 22)
-    panel.btnTest:SetScript("OnClick", function() OB.ToggleTestMode() end)
+     It sat in the corner under the tab list from before there was a Home page --
+     a button with no page to belong to, so it was put where there was room. Home
+     exists precisely to hold the two modes, and a control in two places is one
+     somebody has to work out is the same control. ]==]
 
     panel.status = OB.NewText(panel, "OVERLAY", "GameFontDisableSmall")
     panel.status:SetPoint("BOTTOMRIGHT", panel, -25, 28)
@@ -2251,9 +3237,24 @@ function OB.CreateSettingsPanel()
          and since every entry point starts `if OB.settings then return it`, that
          corpse *was* the settings panel for the rest of the session. Assigning
          last costs nothing: nothing above reads it. ]]--
+    --[==[ **The wheel is on the panel, not on a page.**
+
+         A page is exactly the rectangle its rows sit in, so a wheel handler
+         there would stop working in the margins -- including over the scrollbar,
+         which is the one place somebody expects it to work most. The panel
+         covers all of it and knows which page is in front. ]==]
+    panel:EnableMouseWheel(true)
+    panel:SetScript("OnMouseWheel", function()
+        local cat = OB.SelectedCategory()
+        if not cat then return end
+
+        OB.ScrollPage(cat.page,
+                (cat.page.scroll or 0) - ((arg1 or 0) * SCROLL_STEP))
+    end)
+
     OB.settings = panel
 
-    selectCategory("OmniBars")
+    selectCategory("Home")
     tinsert(UISpecialFrames, "EquadisClassicOverhaulSettings")
 
     return panel
@@ -2265,7 +3266,7 @@ end
      in here takes a global name -- uniqueName's, EqOBOccupant, EqOBProfileDrop,
      the dropdown children Blizzard's template derives from $parent. A second
      attempt would rebind all of them to a fresh set and orphan the first,
-     leaking the whole panel on every /eqob. With rows and pages guarded
+     leaking the whole panel on every /eq. With rows and pages guarded
      individually the only thing left that can throw is the deterministic chrome,
      which would fail identically anyway, so the reason is cached instead. ]]--
 function OB.EnsurePanel()
@@ -2314,12 +3315,8 @@ function OB.RefreshPanel(force)
         OB.LayoutPage(page)
     end
 
-    if OB.testMode then
-        panel.btnTest:SetText("Stop Test")
-    else
-        panel.btnTest:SetText("Test Bars")
-    end
-
+    --[[ Home's own Test Mode row answers to the same state through the shared
+         row machinery, so there is nothing to update here any more. ]]--
     panel.status:SetText("Profile: " .. OB.profileName .. "  |  " .. OB.class)
 end
 
@@ -2347,7 +3344,7 @@ function OB.TogglePanel()
     if not panel then
         Say("the settings panel could not be built: " .. tostring(OB.panelDead))
         Say("every option is still available at the prompt -- type "
-                .. "|cff69ccf0/eqob help|r. A /reload will try again.")
+                .. "|cff69ccf0/eq help|r. A /reload will try again.")
         return
     end
 
@@ -2380,36 +3377,39 @@ end
      and a server may have added its own -- so it is found rather than named. A
      hardcoded neighbour would work on one client and shuffle two buttons on top
      of each other on the next. ]]--
-function OB.InstallGameMenuButton()
+--[[ **Insert one button into the game menu, under whatever is given.**
+
+     Pulled out of `InstallGameMenuButton`, which knew how to add exactly one and
+     hardcoded both the anchor it went under and what it did when clicked. A
+     second button meant either a copy of forty lines or this.
+
+     The awkward part is not the insertion, it is that the menu is a fixed column
+     of buttons anchored to each other: whatever used to sit under the anchor has
+     to be re-anchored under the new button, and the frame has to grow by exactly
+     the height inserted or the bottom button ends up outside it -- which reads
+     as the menu being broken rather than as a button having been added. ]]--
+function OB.InsertGameMenuButton(name, label, under, onClick)
     --[[ **Guarded on the frame, not on the namespace.**
 
          The namespace is rebuilt on a reload and the frame is not, so a guard
-         that only checked `OB.gameMenuButton` would add a second button every
-         time -- and worse, the re-anchor below would find nothing to move,
-         because the first insertion already moved it. Two buttons, one on top
-         of the other, growing the menu each time.
+         that only checked a field on `OB` would add a second button every time
+         -- and worse, the re-anchor below would find nothing to move, because
+         the first insertion already moved it. Two buttons, one on top of the
+         other, growing the menu each time. ]]--
+    local existing = getglobal(name)
+    if existing then return existing, false end
 
-         The frame has a name, so asking for it is the durable question. ]]--
-    local existing = getglobal("EquadisOverhaulMenuButton")
+    if not GameMenuFrame or not under then return nil, false end
+    if type(CreateFrame) ~= "function" then return nil, false end
 
-    if existing then
-        OB.gameMenuButton = existing
-        return existing
-    end
+    local button = CreateFrame("Button", name, GameMenuFrame, "GameMenuButtonTemplate")
+    if not button then return nil, false end
 
-    if not GameMenuFrame or not GameMenuButtonOptions then return nil end
-    if type(CreateFrame) ~= "function" then return nil end
+    button:SetText(label)
+    button:SetWidth(under:GetWidth() or 144)
+    button:SetHeight(under:GetHeight() or 21)
 
-    local button = CreateFrame("Button", "EquadisOverhaulMenuButton",
-            GameMenuFrame, "GameMenuButtonTemplate")
-
-    if not button then return nil end
-
-    button:SetText(OB.addonName)
-    button:SetWidth(GameMenuButtonOptions:GetWidth() or 144)
-    button:SetHeight(GameMenuButtonOptions:GetHeight() or 21)
-
-    --[[ **Whatever was under Options, moved under us instead.**
+    --[[ **Whatever was under the anchor, moved under us instead.**
 
          Found by asking each button what it is anchored to rather than by
          knowing its name. `GetPoint` is the only way to ask, and a button with
@@ -2417,47 +3417,70 @@ function OB.InstallGameMenuButton()
          skipped rather than treated as the answer. ]]--
     local below
 
-    for _, name in ipairs({ "GameMenuButtonKeybindings", "GameMenuButtonMacros",
-                            "GameMenuButtonUIOptions", "GameMenuButtonSoundOptions",
-                            "GameMenuButtonLogout", "GameMenuButtonQuit" }) do
-        local candidate = getglobal(name)
+    for _, other in ipairs({ "GameMenuButtonKeybindings", "GameMenuButtonMacros",
+                             "GameMenuButtonUIOptions", "GameMenuButtonSoundOptions",
+                             "GameMenuButtonLogout", "GameMenuButtonQuit" }) do
+        local candidate = getglobal(other)
 
-        if candidate and candidate.GetPoint and not below then
+        if candidate and candidate ~= button and candidate.GetPoint and not below then
             local _, relative = candidate:GetPoint(1)
-            if relative == GameMenuButtonOptions then below = candidate end
+            if relative == under then below = candidate end
         end
     end
 
     button:ClearAllPoints()
-    button:SetPoint("TOP", GameMenuButtonOptions, "BOTTOM", 0, -1)
+    button:SetPoint("TOP", under, "BOTTOM", 0, -1)
 
     if below then
         below:ClearAllPoints()
         below:SetPoint("TOP", button, "BOTTOM", 0, -1)
     end
 
-    --[[ Grown by exactly what was inserted, or the bottom button ends up outside
-         the frame -- which reads as the menu being broken rather than as one
-         button having been added. ]]--
     if GameMenuFrame.SetHeight and GameMenuFrame.GetHeight then
         GameMenuFrame:SetHeight((GameMenuFrame:GetHeight() or 0)
                 + (button:GetHeight() or 21) + 1)
     end
 
     button:SetScript("OnClick", function()
-        --[[ The menu closes first. Opening a settings window behind a modal
-             game menu is a window nobody can reach. ]]--
+        --[[ The menu closes first. Opening a window behind a modal game menu is
+             a window nobody can reach. ]]--
         if type(HideUIPanel) == "function" then
             HideUIPanel(GameMenuFrame)
         else
             GameMenuFrame:Hide()
         end
 
-        OB.TogglePanel()
+        onClick()
     end)
 
-    OB.gameMenuButton = button
-    return button
+    return button, true
+end
+
+--[[ ECO's own two buttons, in the order somebody reaches for them: settings
+     first, then the addon list.
+
+     The list button goes under the settings one rather than under Options, so
+     the pair stays together however many times this runs and whatever else has
+     inserted itself into the menu meanwhile. ]]--
+function OB.InstallGameMenuButton()
+    if not GameMenuButtonOptions then return nil end
+
+    local settings = OB.InsertGameMenuButton("EquadisOverhaulMenuButton",
+            OB.addonName, GameMenuButtonOptions, function() OB.TogglePanel() end)
+
+    if not settings then return nil end
+    OB.gameMenuButton = settings
+
+    --[[ **1.12 has no addon list once you are in the world.** The client's own
+         is on the character-select screen and nowhere else, which is why every
+         UI pack ships one and why removing whichever addon was providing it
+         leaves a hole where people expect a button. ]]--
+    OB.gameMenuAddOns = OB.InsertGameMenuButton("EquadisOverhaulAddOnsButton",
+            "AddOns", settings, function()
+                if OB.ToggleAddOnList then OB.ToggleAddOnList() end
+            end)
+
+    return settings
 end
 
 -- ---------------------------------------------------------------------------

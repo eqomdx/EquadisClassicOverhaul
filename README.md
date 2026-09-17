@@ -177,7 +177,7 @@ full**, and its color is the whole answer. All five colors are yours to set:
 | In range | green |
 | Too close — inside a bow's dead zone | orange |
 | Too far | red |
-| No line of sight — something is in the way | violet, and off by default |
+| No line of sight — something is in the way | violet |
 | No target | dark grey `#1f1f1f` — a placeholder, so you can see the bar is there |
 
 The question is about **your equipped ranged weapon**, not some generic distance.
@@ -210,11 +210,17 @@ threshold* is one bit of a distance. Ask about a spell that reaches 35 yards and
 one that reaches 40: no, then yes, puts your target between the two. Enough
 spells and the answer narrows to a five-yard step.
 
-The label shows that step: `<5y`, `5y`, `10y`, `15y`, up to `50y+`. **The same
-steps whatever you are pointing at** — friendly, neutral or hostile — because an
-exact distance, where one is available, is floored onto the same steps rather
-than shown to the yard. A readout that said `23y` on a friendly NPC and `20y` on
-a mob would be two readouts wearing one label. Both ends are open and say so.
+The label shows that step: `<5y`, `5y`, `10y`, `15y`, up to `50y+`. Both ends of
+a band are open and say so — nothing is ever at zero, and past fifty the rungs
+get coarse enough that one honest ceiling beats a number pretending otherwise.
+
+**When something can measure, the label is the measurement**, to the yard:
+`23y`, and no ceiling, because there is nothing to admit. That needs an exact
+source — UnitXP SP3, a Nampower build with `GetUnitDistance`, or SuperWoW for
+friendly units — and the ladder above is what runs when none is installed. The
+two read the same way, `23y` beside `20y`, so the label does not change character
+when you switch targets; it simply gets five times finer when the client can
+answer.
 
 You do not need to know the spells, and neither did the Overhaul — the rung list came
 out of the client's own range table. Several of them are not player spells at
@@ -232,7 +238,7 @@ directions is not a threshold.
 
 Three settings govern the labels and the line-of-sight hold:
 
-- **Show Active Distance** — the live stepped figure in the middle of the bar.
+- **Show Active Distance** — the live figure in the middle of the bar.
 - **Show In-Range Distances** — your equipped attack's whole usable range, `[8-30y]`, on
   the right. Off by default: a number that never changes, on a bar whose job is
   to change, invites being read as the answer.
@@ -241,13 +247,13 @@ Three settings govern the labels and the line-of-sight hold:
   the future and only you know how long a guess you want. Short flickers; long
   keeps lying after you have stepped clear.
 
-`/eqob rangedebug` prints the rungs your client produced. `/eqob rangescan` goes
+`/eq rangedebug` prints the rungs your client produced. `/eq rangescan` goes
 further and lists every band the client *could* measure, naming one spell for
 each — so a gap in the readout is closed by adding that spell's ID to
 `LADDER_IDS` in `modules/range.lua`, with no other change.
 
-**Check Line Of Sight** is off by default and needs nothing installed, but you
-should know how it works before turning it on. Vanilla will not let an addon
+**Check Line Of Sight** is on by default and needs nothing installed, but how
+quickly it answers depends on what you have. Vanilla will not let an addon
 *ask* whether something is in the way — there is no such API — so the only signal
 is the client's own refusal: try to shoot, get *Target not in line of sight*, and
 the bar turns violet for a couple of seconds. It cannot tell you in advance, and
@@ -471,29 +477,29 @@ loads, once. RogueBars' own saved variables are never modified.
 ## Commands
 
 ```
-/eqob                          open the panel            (also /ob, /omnibars)
-/eqob help                     every option, every scope
-/eqob scale 120                a general option
-/eqob bar resource h 20        a bar's geometry
-/eqob power ticker nofull      a module's setting
-/eqob profile use Raiding      use|new|copy|delete
-/eqob restack                  re-stack the occupied bars
-/eqob windows                  where each meter window is stored and drawn
-/eqob test                     preview every bar without a target
-/eqob selftest                 check the addon against your client
-/eqob rangedebug               every value behind the distance readout
-/eqob rangescan                every distance band this client can measure
-/eqob reset                    this profile   ( reset all for every profile )
+/eq                          open the panel            (also /ob, /omnibars)
+/eq help                     every option, every scope
+/eq scale 120                a general option
+/eq bar resource h 20        a bar's geometry
+/eq power ticker nofull      a module's setting
+/eq profile use Raiding      use|new|copy|delete
+/eq restack                  re-stack the occupied bars
+/eq windows                  where each meter window is stored and drawn
+/eq test                     preview every bar without a target
+/eq selftest                 check the addon against your client
+/eq rangedebug               every value behind the distance readout
+/eq rangescan                every distance band this client can measure
+/eq reset                    this profile   ( reset all for every profile )
 ```
 
-`/eqob rangedebug` is for when the Distance bar disagrees with your eyes. Target
+`/eq rangedebug` is for when the Distance bar disagrees with your eyes. Target
 something, run it, and it prints every raw client answer behind the reading —
 which extensions replied and with what, what each of the four backends says about
 *that* unit, and the state and yardage that came out. It also names the target
 type, so a run against a friendly NPC and a run against an enemy player can be
 compared line for line.
 
-`/eqob selftest` is the one to run first if something looks wrong. It verifies
+`/eq selftest` is the one to run first if something looks wrong. It verifies
 that every API each module needs exists on your client, that the bars were built
 with a size and a position, that the values they draw from are sane, which range
 backend you ended up on, and that the settings panel built completely — then
@@ -569,7 +575,7 @@ luajit tests/run.lua
 That half proves the addon is internally consistent. It cannot prove the client
 agrees — a stub that shares a wrong assumption passes happily, which is exactly
 how a settings panel that could not open once shipped past a green suite.
-`/eqob selftest` is the other half, and asks the questions only the real client
+`/eq selftest` is the other half, and asks the questions only the real client
 can answer.
 
 Any Lua 5.1-compatible interpreter works; LuaJIT is the closest easily available
@@ -580,7 +586,7 @@ deal 5.0 rejects. LuaJIT running the suite is the stricter gate of the two.
 **Adding a file to the TOC needs a full client restart.** 1.12 reads each addon's
 file list once, at startup, so `/reload` re-runs only the files the client
 already knew about — the version string updates, the new module does not load,
-and it looks exactly like a broken module. `/eqob selftest` says so if no feature
+and it looks exactly like a broken module. `/eq selftest` says so if no feature
 module registered.
 
 ## Credits

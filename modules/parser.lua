@@ -377,15 +377,49 @@ local defaults = {}
      A pure function of the line and the event, deliberately: the damage meter
      drives it, the tests drive it, and neither has to stand up a frame or fire an
      event to ask what a sentence means. ]]--
+--[[ **The last line read, and what it came to.**
+
+     This function is the hottest thing in the addon: every combat event in the
+     game arrives here, and in a forty-man raid that is hundreds a second. It is
+     also called **twice for every one of them** -- the damage meter and the
+     threat meter each register the full combat event list and each parse the
+     line independently, doing identical work and throwing away identical
+     results.
+
+     Cached on the exact event and text, which is enough: the same sentence for
+     the same event is the same line, and the two readers get it within one
+     frame of each other. That halves the parsing outright.
+
+     **The result table is reused rather than rebuilt**, which the cache is what
+     makes safe: both readers see the same table, both read their fields
+     immediately, and neither keeps it. A fresh table per line was hundreds of
+     tables a second in a raid, and on 1.12 that is not CPU -- it is garbage, and
+     it is paid later as the collection pause people call lag. ]]--
+local lastEvent, lastText, lastResult
+local result = {}
+
 function OB.ReadCombatLine(event, text)
     if type(text) ~= "string" then return nil end
+
+    if event == lastEvent and text == lastText then return lastResult end
+
+    lastEvent, lastText = event, text
+    lastResult = nil
 
     local patterns = OB.parser.events[event]
     if not patterns then return nil end
 
+    --[[ **`string.gsub` allocates a new string every time, including when it
+         replaced nothing** -- and almost no line carries an absorb or a resist
+         trailer. Looked for first with `string.find`, which allocates nothing.
+         Same fix the tooltip cleaners needed, and for the same reason. ]]--
     local absorb, resist = trailers()
-    if absorb then text = string.gsub(text, absorb, "") end
-    if resist then text = string.gsub(text, resist, "") end
+    if absorb and string.find(text, absorb) then
+        text = string.gsub(text, absorb, "")
+    end
+    if resist and string.find(text, resist) then
+        text = string.gsub(text, resist, "")
+    end
 
     local player = UnitName("player")
 
@@ -409,14 +443,18 @@ function OB.ReadCombatLine(event, text)
                      collision, not a hit. Reporting zero damage would put a
                      phantom row in the meter for whoever was named. ]]--
                 if amount and source and target then
-                    return {
-                        source = source,
-                        spell = spell,
-                        target = target,
-                        amount = amount,
-                        school = school,
-                        kind = kind,
-                    }
+                    --[[ Written into the one table rather than a new one. See
+                         the note above `lastEvent`: this is the hottest path in
+                         the addon and the readers are immediate. ]]--
+                    result.source = source
+                    result.spell = spell
+                    result.target = target
+                    result.amount = amount
+                    result.school = school
+                    result.kind = kind
+
+                    lastResult = result
+                    return result
                 end
             end
         end

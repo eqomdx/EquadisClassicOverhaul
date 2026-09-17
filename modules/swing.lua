@@ -135,6 +135,51 @@ local function shotLanded()
     swing.rangedStart = now
 end
 
+--[[ **The abilities that are swung rather than cast.**
+
+     Heroic Strike, Cleave, Maul and Raptor Strike are queued onto your next
+     melee swing: pressing one does nothing until the weapon comes round, and
+     then it *replaces* the white hit. The swing is spent.
+
+     The client does not report them as melee. There is no
+     `CHAT_MSG_COMBAT_SELF_HITS` line for a Heroic Strike -- it arrives as
+     `CHAT_MSG_SPELL_SELF_DAMAGE`, the same event a Fireball uses, because as
+     far as the combat log is concerned it is a spell.
+
+     So the swing timer never saw them. A warrior using Heroic Strike on cooldown
+     -- which is every warrior -- had a swing bar that filled up and then sat
+     there, because the event that would have reset it never came and the one
+     that did was being handed to the ranged timer. That is the whole of the
+     bug: the bar was not wrong about the swing, it never heard about it.
+
+     **Matched by name, which is a locale assumption and the only one
+     available.** The combat log gives no flag separating an on-next-swing
+     ability from any other spell; the text is the only difference there is. On
+     an English client this is exact. On another it stops recognising them,
+     which is where the module was already. ]]--
+local ON_NEXT_SWING = {
+    ["Heroic Strike"] = true,
+    ["Cleave"] = true,
+    ["Maul"] = true,
+    ["Raptor Strike"] = true,
+}
+
+--[[ Whether a spell-damage line was actually a melee swing. Exposed on `OB` so
+     the tests and anything else asking get the same answer this uses, rather
+     than a second copy of the list. ]]--
+function OB.IsOnNextSwing(line)
+    if type(line) ~= "string" then return false end
+
+    for name in pairs(ON_NEXT_SWING) do
+        --[[ Plain find rather than a pattern: these are names, and one of them
+             would otherwise have to be escaped the day somebody adds an ability
+             with a hyphen in it. ]]--
+        if string.find(line, name, 1, true) then return true end
+    end
+
+    return false
+end
+
 local tracker = CreateFrame("Frame", "EquadisClassicOverhaulSwing", UIParent)
 
 tracker:SetScript("OnEvent", function()
@@ -145,6 +190,15 @@ tracker:SetScript("OnEvent", function()
         stopShooting()
         return
     elseif event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
+        --[[ **On-next-swing abilities arrive here rather than as melee**, and
+             they spend the swing. Checked before the ranged path, because a
+             Heroic Strike is a melee swing wearing a spell's event and belongs
+             to the weapon timer. ]]--
+        if OB.IsOnNextSwing(arg1) then
+            swingLanded()
+            return
+        end
+
         shotLanded()
         return
     end

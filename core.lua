@@ -12,12 +12,10 @@
   whole addon through one event handler. Frames hang off this table instead.
 ]]--
 
-local _G = getfenv(0)
-
 EquadisClassicOverhaul = {}
 local OB = EquadisClassicOverhaul
 
-OB.version = "0.86.3"
+OB.version = "0.99.297"
 OB.addonName = "Equadis' Classic Overhaul"
 
 --[[ The addon folder name is load-bearing: every media path below hardcodes it,
@@ -51,7 +49,40 @@ OB.class = playerClass or "WARRIOR"
      something a reader can see. ]]--
 OB.tagColor = "|cff008b8b"
 
+--[==[ **One switch that speaks for eight subsystems should say one thing.**
+
+     Edit mode unlocks every module that has something to move, and each of them
+     announced itself: *Action Bars: drag mode on*, *Buff Frames: move mode on*,
+     *Party Frames*, *Unit Frames*, and then Edit Mode's own line under all of
+     them. Five lines in the harness and more in a real profile, every time the
+     mode is toggled -- and toggled is what it is for, so it is five lines going
+     in and five coming out.
+
+     Held here rather than in the eight modules because that is where the
+     decision belongs: a module saying what it did is right when somebody asked
+     *it* to do something, and noise when somebody asked for all of them at once.
+     Each `SetDragMode` stays exactly as it was and keeps working on its own.
+
+     **Held, not dropped.** A module that refuses -- the party frames decline
+     while the feature is off -- is saying something the reader needs, and
+     swallowing that would trade a noisy toggle for a silent failure. Edit mode
+     reads the held lines back and folds them into its one message. ]==]
+function OB.HoldPrint(on)
+    if on then
+        OB.heldPrints = {}
+    else
+        local held = OB.heldPrints
+        OB.heldPrints = nil
+        return held
+    end
+end
+
 function OB.Print(msg, from)
+    if OB.heldPrints then
+        table.insert(OB.heldPrints, { msg = tostring(msg), from = from })
+        return
+    end
+
     DEFAULT_CHAT_FRAME:AddMessage(OB.tagColor .. "Eq " .. (from or "Overhaul")
             .. ":|cffffffff " .. tostring(msg))
 end
@@ -65,51 +96,67 @@ end
 -- reload-required warning
 -- ---------------------------------------------------------------------------
 
---[[ A setting that cannot take effect immediately must say so where the user is
-     looking, not bury the fact in chat.  The banner is created lazily because
-     core.lua loads before the settings panel and most sessions never need it. ]]--
+--[==[ **A setting that cannot take effect immediately must say so where the
+     reader is looking, and there is now one place that does that.**
+
+     This built a banner of its own: a dark red strip across the top of the
+     screen, its own backdrop, its own close button, its own idea of where a
+     notice goes. Meanwhile edit mode -- a whole mode, which unlocks every frame
+     in the interface -- announced itself in **chat** and drew nothing at all,
+     while bind mode had a banner of its own again.
+
+     Three notices, three answers, none of them each other's. So there is one
+     surface now and it belongs to edit mode, because edit mode is the one that
+     needed an interface anyway: `OB.EditPanel` in `editmode.lua`.
+
+     **The entry point stays here** because `core.lua` loads first and everything
+     calls this; only the frame moved. Held rather than drawn if the panel is not
+     loaded, so a notice raised before `editmode.lua` has run is not lost -- it
+     appears the moment the panel next refreshes. ]==]
 function OB.RequireReload(reason)
-    if not OB.reloadWarning then
-        local f = CreateFrame("Frame", "EquadisClassicOverhaulReloadWarning", UIParent)
-        f:SetWidth(560)
-        f:SetHeight(54)
-        f:SetPoint("TOP", UIParent, "TOP", 0, -18)
-        f:SetFrameStrata("FULLSCREEN_DIALOG")
-        f:SetBackdrop({
-            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile = true, tileSize = 16, edgeSize = 16,
-            insets = { left = 4, right = 4, top = 4, bottom = 4 },
-        })
-        f:SetBackdropColor(0.08, 0.03, 0.03, 0.96)
-        f:SetBackdropBorderColor(1, 0.35, 0.2, 1)
-        f:Hide()
+    OB.pendingNotice = (reason and reason ~= "") and tostring(reason) or true
 
-        f.text = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        f.text:SetPoint("LEFT", f, "LEFT", 14, 0)
-        f.text:SetWidth(390)
-        f.text:SetJustifyH("LEFT")
-
-        f.reload = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-        f.reload:SetWidth(92)
-        f.reload:SetHeight(22)
-        f.reload:SetPoint("RIGHT", f, "RIGHT", -34, 0)
-        f.reload:SetText("Reload UI")
-        f.reload:SetScript("OnClick", function()
-            if ReloadUI then ReloadUI() end
-        end)
-
-        f.close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-        f.close:SetPoint("TOPRIGHT", f, "TOPRIGHT", 1, 2)
-        f.close:SetScript("OnClick", function() f:Hide() end)
-
-        OB.reloadWarning = f
+    if type(OB.RefreshEditPanel) == "function" then
+        OB.RefreshEditPanel()
+        return
     end
 
-    local text = "Reload required"
-    if reason and reason ~= "" then text = text .. ": " .. tostring(reason) end
-    OB.reloadWarning.text:SetText(text)
-    OB.reloadWarning:Show()
+    --[[ No panel yet, and a notice nobody can see is not a notice. Chat is the
+         floor, not the answer. ]]--
+    OB.Print("reload required" .. (type(reason) == "string"
+            and (": " .. reason) or ""), "Settings")
+end
+
+-- ---------------------------------------------------------------------------
+-- a tooltip this addon has placed itself
+-- ---------------------------------------------------------------------------
+
+--[==[ **This addon's own windows say where their tooltips go, and the
+     placement policy leaves them alone.**
+
+     The tooltip module wraps `GameTooltip.SetOwner` so that a *client* frame
+     anchoring a tooltip beside itself -- the need/greed popup, an action button
+     -- still lands where the Tooltip page says tooltips go. That was the fix for
+     the roll popup's tooltip ignoring every setting.
+
+     It swept up this addon's own calls too. A damage meter row, a bag slot, an
+     item browser line, the reputation bar: each anchors its tooltip beside the
+     thing it describes on purpose, some with offsets, and a policy written for
+     the client's frames has no business overriding a decision this addon made
+     about its own. Ten deliberate anchors were being moved to the screen's fixed
+     spot, which is the regression this exists to end.
+
+     So this addon's own callers go through here. The flag is one-shot -- set,
+     honoured by the wrapper, cleared -- so nothing about the tooltip's state
+     outlives the call that asked for it. ]==]
+function OB.OwnTooltip(owner, anchor, x, y)
+    if not GameTooltip or not GameTooltip.SetOwner then return false end
+
+    GameTooltip.eqEcoOwnAnchor = true
+    GameTooltip:SetOwner(owner, anchor, x, y)
+    GameTooltip.eqEcoOwnAnchor = nil
+
+    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -121,6 +168,34 @@ local floor = math.floor
 function OB.Round(num)
     if num >= 0 then return floor(num + 0.5) end
     return -floor(-num + 0.5)
+end
+
+--[==[ **Whitespace off both ends of a typed argument.**
+
+     Written because two commands already called it and it did not exist. Both
+     spelled the call `OB.Trim and OB.Trim(msg) or msg` -- the guard that is
+     meant to survive a missing helper, and which quietly *became* the
+     behaviour: the trim never happened and nothing said so.
+
+     `/way clear ` with a trailing space did not match "clear", and
+     `/addfriend    ` would have written a friend whose name is four spaces.
+     Neither is visible from reading the call, which is the point: a defensive
+     `and ... or` around a function that is never defined is indistinguishable
+     from one around a function that is.
+
+     `%s` covers the space a keyboard produces and the tab a paste can. The
+     non-greedy capture is what makes it work in one pass on 1.12's pattern
+     matcher. ]==]
+function OB.Trim(text)
+    if type(text) ~= "string" then return "" end
+
+    --[[ Held in a local first. `string.gsub` answers the string *and* how many
+         substitutions it made, and `return` on the call would hand both back --
+         harmless in `local x = Trim(s)`, and not harmless at all in
+         `table.insert(t, Trim(s))`, where a second return in the final argument
+         position becomes a third argument and inserts at an index. ]]--
+    local out = string.gsub(text, "^%s*(.-)%s*$", "%1")
+    return out
 end
 
 --[[ A value held inside a range. The same bounds the sliders use, so a value
@@ -240,6 +315,29 @@ end
 --[[ Statusbar textures. The config stores the index and the panel derives the
      label by stripping everything up to the last backslash, so appending an
      entry here is all that is needed to ship a new texture. ]]--
+--[[ **The client's dropdown globals, seeded before anything builds a dropdown.**
+
+     `UIDROPDOWNMENU_OPEN_MENU` is a frame *name* and starts life nil: FrameXML
+     only assigns it when something actually opens a menu. 1.12's
+     `UIDropDownMenu.lua` builds names out of it, so touching the dropdown API
+     before any menu has ever been opened throws "attempt to concatenate global
+     'UIDROPDOWNMENU_OPEN_MENU' (a nil value)" -- once per control. The item
+     browser's filter row hit it five times on `/db` on a fresh login.
+
+     Filled in here rather than at each call site, because every dropdown in the
+     addon has the same exposure: the options panel builds around fifty of them
+     and only escapes by being opened later in a session, which is luck rather
+     than design.
+
+     An empty string is the right value: no frame is named "", so every
+     comparison that was false against nil stays false, and the concatenations
+     that were throwing now produce a string that matches nothing. Only ever
+     written when the client has left it unset -- Bagshui clears this same global
+     deliberately for its own menus, and it is not ours to own. ]]--
+if UIDROPDOWNMENU_OPEN_MENU == nil then UIDROPDOWNMENU_OPEN_MENU = "" end
+if UIDROPDOWNMENU_MENU_LEVEL == nil then UIDROPDOWNMENU_MENU_LEVEL = 1 end
+if UIDROPDOWNMENU_MENU_VALUE == nil then UIDROPDOWNMENU_MENU_VALUE = "" end
+
 OB.textures = {
     OB.mediaPath .. "textures\\Smooth",
     OB.mediaPath .. "textures\\ShaguPlates",
@@ -267,6 +365,11 @@ OB.icons = {
     close    = OB.mediaPath .. "textures\\icons\\close",
     new      = OB.mediaPath .. "textures\\icons\\new",
     reset    = OB.mediaPath .. "textures\\icons\\reset",
+
+    --[==[ The junk bin on the merchant window. Its own file rather than a client
+         icon, because 1.12 has no dustbin: nothing in `Interface\Icons` reads as
+         "get rid of this", and the nearest candidates are bags. ]==]
+    trash    = OB.mediaPath .. "textures\\icons\\trash",
 }
 
 --[[ Every window with a header sits at the same height, so two meters open side
@@ -303,22 +406,323 @@ end
      real font flag and rendered identically -- so the outline is a plain on/off
      flag rather than a list. ]]--
 
-OB.borders = { "None", "Thin", "Standard" }
+--[[ **Four borders, and the same four everywhere.**
 
--- how far the border art sits outside the bar, per OB.borders index
-OB.borderPads = { 0, 3, 5 }
+     `None`, `Thin`, `Classic` and `Blizzard`. Every element that draws a border
+     offers all four, so the word means one thing across the addon rather than
+     each subsystem inventing its own list.
 
---[[ One table for bars and (later) meter windows, so Thin and Standard mean the
-     same thing everywhere. ]]--
-OB.borderEdges = {
-    [2] = { edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 8 },
-    [3] = { edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 14 },
+     `Standard` used to be the third and is now `Classic`: it was never a
+     standard of anything, and the name said nothing about what it looked like.
+     A profile that stored the old index keeps the same border, because the
+     index is what is saved and three is still three.
+
+     `Blizzard` is the ornate one with corner ornaments, from the client's own
+     dialog art. `Thin` and `Classic` are a single-pixel line and a bevelled
+     one -- the same shapes the nameplate addon this borrows from uses, under
+     its MIT licence with the notice kept beside the files. ]]--
+OB.borders = { "None", "Thin", "Classic", "Blizzard" }
+
+--[==[ **How heavy a border the text wears**, which was a switch and is now a
+     choice of two weights.
+
+     1.12 draws text with `OUTLINE` or `THICKOUTLINE`, and the difference is the
+     difference between text that is readable over a spell icon and text that is
+     not. Keybinds are the case that asked for it -- small pale letters on top of
+     art nobody chose for its contrast -- but every string this addon draws sits
+     over something.
+
+     Stored as an index like every other list on the panel. Ordered so that the
+     index is the weight: nothing, thin, thick. ]==]
+--[==[ **The file behind a font's display name.**
+
+     `OB.fonts` and `OB.fontPaths` are parallel lists and every reader that
+     wanted one from the other walked them itself. One place, because the answer
+     for a name nothing ships has to be **nil** rather than the first font in the
+     list -- `SetFont` with a bad path draws nothing at all, and a silently blank
+     label is worse than the wrong face. ]==]
+function OB.FontFile(name)
+    if not name or name == "" then return nil end
+
+    for i = 1, table.getn(OB.fonts) do
+        if OB.fonts[i] == name then return OB.fontPaths[i] end
+    end
+
+    return nil
+end
+
+OB.fontOutlines = { "None", "Thin", "Thick" }
+
+--[==[ **The class portraits, in one place.**
+
+     `UI-CLASSES-CIRCLES` is the round, transparent atlas this addon bundles --
+     round because the square one leaks its corners outside a portrait opening,
+     which is a fault this has already been fixed for once. The coordinates are
+     the donor's, transcribed.
+
+     Here rather than private to the unit frames because the walkthrough draws
+     the same portraits: two copies of a coordinate table is two things to get
+     wrong, and the one that drifts is the copy nobody is looking at. ]==]
+OB.classCircleArt = OB.mediaPath .. "textures\\UI-CLASSES-CIRCLES"
+
+OB.classCircles = {
+    HUNTER  = { 0,          0.25,       0.25, 0.5  },
+    WARRIOR = { 0,          0.25,       0,    0.25 },
+    ROGUE   = { 0.49609375, 0.7421875,  0,    0.25 },
+    MAGE    = { 0.25,       0.49609375, 0,    0.25 },
+    PRIEST  = { 0.49609375, 0.7421875,  0.25, 0.5  },
+    WARLOCK = { 0.7421875,  0.98828125, 0.25, 0.5  },
+    DRUID   = { 0.7421875,  0.98828125, 0,    0.25 },
+    SHAMAN  = { 0.25,       0.49609375, 0.25, 0.5  },
+    PALADIN = { 0,          0.25,       0.5,  0.75 },
 }
 
+--[[ One class circle onto a texture that already exists, or nothing at all for
+     a class this atlas does not carry -- a server with a class of its own would
+     otherwise be given a corner of somebody else's. ]]--
+function OB.SetClassCircle(texture, class)
+    local coords = class and OB.classCircles[class]
+    if not texture or not coords or not texture.SetTexture then return false end
+
+    texture:SetTexture(OB.classCircleArt)
+
+    if texture.SetTexCoord then
+        texture:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+    end
+
+    return true
+end
+
+--[==[ **The flags `SetFont` wants, from whatever the profile is holding.**
+
+     Both spellings are answered because both exist in saved variables. Before
+     this was a list it was a boolean, and a profile written by an older build
+     says `true` -- which is Thin, the only outline there was. The migration
+     rewrites them, and this makes a profile that has somehow escaped it draw
+     correctly anyway rather than dropping its outline silently.
+
+     Anything unrecognised is no outline, which is the client's own default and
+     the safe end of the mistake. ]==]
+function OB.FontFlags(value)
+    if value == true then return "OUTLINE" end
+    if not value then return nil end
+
+    local index = tonumber(value)
+
+    if not index then
+        --[[ The name, for anything that stores one rather than an index. ]]--
+        for i = 1, table.getn(OB.fontOutlines) do
+            if string.lower(OB.fontOutlines[i]) == string.lower(tostring(value)) then
+                index = i
+            end
+        end
+    end
+
+    if index == 2 then return "OUTLINE" end
+    if index == 3 then return "THICKOUTLINE" end
+
+    return nil
+end
+
+-- how far the border art sits outside the bar, per OB.borders index
+OB.borderPads = { 0, 2, 5, 4 }
+
+--[[ One table for bars, meter windows and anything else that draws a border, so
+     Thin means the same thickness on all of them. ]]--
+--[==[ **`outset` is where the ink actually is, and it was being guessed.**
+
+     A backdrop's edge band is drawn *inward* from the frame's boundary, and in
+     all three of these the opaque art hugs the **outer** end of that band --
+     nothing is centred in it. So a frame placed to put the art somewhere has to
+     be offset by how far the art reaches inward, and nothing else.
+
+     Measured off the files rather than reasoned about, by decoding them and
+     reading the alpha across one edge tile:
+
+       * `textures\\border` -- 64x8, opaque column 0 of 8.
+       * `UI-Tooltip-Border` -- 128x16, opaque columns 1..5 of 16.
+       * `UI-DialogBox-Border` -- 256x32, opaque columns 3..13 of 32.
+
+     `outset` is the inner end of that span scaled to the size the edge is drawn
+     at, so a frame offset by it has the whole ornament sitting *outside* what it
+     frames with its inner edge on the boundary. The tooltip was using half the
+     edge size instead, which is right only for art running down the middle of
+     the tile -- and gave a four, eight and nineteen pixel gap respectively. ]==]
+OB.borderEdges = {
+    [2] = {
+        edgeFile = OB.mediaPath .. "textures\\border",
+        edgeSize = 8,
+        outset = 1,
+        insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    },
+    [3] = {
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        edgeSize = 14,
+        outset = 5,
+    },
+    [4] = {
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        edgeSize = 32,
+        outset = 14,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    },
+}
+
+--[==[ **A border's corners cannot be bigger than the thing they frame.**
+
+     A backdrop draws eight pieces, and the four corners are `edgeSize` square.
+     Put a 14-pixel corner on a bar twenty-two pixels tall and the top pair and
+     the bottom pair are asking for twenty-eight pixels of a twenty-two-pixel
+     frame: they overlap in the middle, and the border reads as a doubled smear
+     across the bar rather than an outline around it.
+
+     That is what `Classic` was doing to health bars. It is not a fault of that
+     style -- the same art is right on a tooltip -- it is a fault of using one
+     edge size for a tooltip and for a twelve-pixel bar. So the size is clamped
+     to what actually fits, per widget, rather than every caller being trusted
+     to pick a number.
+
+     **Returned as a copy.** `OB.borderEdges` is one shared table read by
+     nameplates, tooltips, meters and bars; narrowing an entry in place would
+     shrink the border on everything else styled afterwards -- the same trap as
+     writing into the table `OB.Look` hands back. ]==]
+local borderFitCache = {}
+
+function OB.BorderEdge(index, width, height)
+    local edge = OB.borderEdges[index]
+    if not edge then return nil end
+
+    local size = edge.edgeSize or 8
+
+    --[==[ The shorter side decides, because both sides carry two corners. ]==]
+    local shortest
+
+    if type(width) == "number" and width > 0 then shortest = width end
+    if type(height) == "number" and height > 0
+            and (not shortest or height < shortest) then
+        shortest = height
+    end
+
+    if not shortest then return edge end
+
+    local fits = math.floor(shortest / 2)
+    if fits < 1 then fits = 1 end
+    if fits >= size then return edge end
+
+    local key = index .. ":" .. fits
+    if borderFitCache[key] then return borderFitCache[key] end
+
+    --[==[ The insets come down with it. They are how far the background is held
+         off the edge, so leaving them at full width on a narrowed border eats
+         the middle of a small bar. ]==]
+    local scale = fits / size
+    local out = { edgeFile = edge.edgeFile, edgeSize = fits }
+
+    --[[ Scaled with everything else: `outset` is a distance measured in the
+         art, so an edge narrowed to fit a small bar has a proportionally
+         smaller one. Left at full size it would describe art nobody is
+         drawing. ]]--
+    if edge.outset then out.outset = edge.outset * scale end
+
+    if edge.tile ~= nil then out.tile = edge.tile end
+    if edge.bgFile then out.bgFile = edge.bgFile end
+
+    if edge.insets then
+        out.insets = {
+            left = (edge.insets.left or 0) * scale,
+            right = (edge.insets.right or 0) * scale,
+            top = (edge.insets.top or 0) * scale,
+            bottom = (edge.insets.bottom or 0) * scale,
+        }
+    end
+
+    borderFitCache[key] = out
+    return out
+end
+
+--[==[ **A CVar that may not exist, asked without taking the interface down.**
+
+     `GetCVar` does not answer nil for a name it does not know. It **raises**:
+
+         Couldn't find CVar named 'rotateMinimap'
+
+     which is a real error from a real reload, from asking whether the minimap
+     rotates on a client that has no such setting. Guarding with
+     `type(GetCVar) == "function"` -- which two places in this addon did -- checks
+     that the *function* is there and says nothing about the *name*, so it reads
+     like a guard and protects against nothing.
+
+     Every name an addon does not set itself is a name some client may not have:
+     `rotateMinimap` here, and the four `uf*` cvars in the migration, which
+     belong to an addon most people never ran. That one would have thrown inside
+     `LoadConfig`, which is the whole addon rather than one feature.
+
+     So the question is asked through here, once, and a name that does not exist
+     answers nil the way it should have. ]==]
+function OB.CVar(name)
+    if type(GetCVar) ~= "function" or not name then return nil end
+
+    local ok, value = pcall(GetCVar, name)
+    if not ok then return nil end
+
+    return value
+end
+
+--[==[ **A glow is not a border with a soft texture in it.**
+
+     A border puts its one solid line at the *outer* boundary of the band it is
+     given, which is why every one of these reads as an outline: an outline is
+     what it is. Drawn a second time further out -- which is what the nameplate
+     module's "glow" was -- it is not a glow, it is a second outline with a gap
+     behind it, and the gap is the thing that gives it away.
+
+     A glow runs the other way. It is opaque against the thing it surrounds and
+     falls off to nothing at the outer boundary, so there is no edge anywhere in
+     it and nothing to leave a gap. That is what `textures\\glow` is: the same
+     eight-tile edge convention as `textures\\border`, with the ramp reversed
+     and a quarter falloff in the corners. It is white, so the colour is entirely
+     the caller's.
+
+     **Sized to the band, by the caller.** Anchor the frame `n` pixels outside
+     whatever it wraps and ask for `n`, and the glow spans exactly the gap it was
+     given: solid where it meets the bar, gone at the edge. Any other edge size
+     leaves either a hard stop partway out or a band that never reaches the thing
+     it is glowing around. ]==]
+OB.glowEdgeFile = OB.mediaPath .. "textures\\glow"
+
+local glowEdges = {}
+
+function OB.GlowEdge(size)
+    size = math.floor(tonumber(size) or 0)
+    if size < 1 then size = 1 end
+
+    if not glowEdges[size] then
+        glowEdges[size] = { edgeFile = OB.glowEdgeFile, edgeSize = size }
+    end
+
+    return glowEdges[size]
+end
+
+--[==[ **Every window this addon owns, out of one table.**
+
+     This was the client's tooltip background inside the client's tooltip border,
+     which is why the item database, the bag window, the addon list and the
+     meters all looked like tooltips somebody had put a list in. Reskinning the
+     settings panel made that obvious: one window had been given a look and the
+     other eight had not.
+
+     A flat fill and a one-pixel edge, which is the same shape the panel draws
+     with rules. `WHITE8X8` for the fill so the colour a window asks for is the
+     colour it gets -- the tooltip background is a patterned texture, so every
+     backdrop colour was being multiplied by somebody else's grey mottling.
+
+     The edge is this addon's own thin border, the same file the Thin option
+     uses on a health bar. See `skin.lua` for the palette and `OB.SkinWindow`
+     for the call that applies this with the colours to match. ]==]
 OB.backdrop = {
-    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 8,
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = OB.mediaPath .. "textures\\border",
+    edgeSize = 8,
     insets = { left = 2, right = 2, top = 2, bottom = 2 },
 }
 
@@ -356,16 +760,56 @@ end
      because OB.Look falls back key by key. Copying them would freeze a
      subsystem's look at whatever the shared one was the day it was registered,
      and then quietly stop following it. ]]--
-function OB.LookOptions()
-    return {
-        { "Appearance", "__h_look", "header" },
+--[[ **The appearance block, and only the parts a subsystem actually uses.**
 
-        { "Bar Texture", "texture", OB.textures, 200 },
-        { "Font", "font", OB.fonts, 200 },
-        { "Font Size", "fontSize", "slider", 6, 24, 1 },
-        { "Font Outline", "fontOutline", "boolean" },
-        { "Border", "border", OB.borders, 200 },
+     `styled` was all or nothing, so a module that draws one line of text got
+     Bar Texture and Border as well -- controls that change nothing, on a page
+     where everything else does. The chat module had exactly this complaint made
+     about it and was answered by dropping the block entirely; the map and the
+     waypoint arrow have the opposite problem, because they *do* use the font
+     and nothing else.
+
+     `styled = true` still means all five, which is what a bar-drawing subsystem
+     wants and what every existing module said. A table names the parts:
+
+         styled = { font = true, fontOutline = true }
+
+     Font Size is separate from Font on purpose. The clock and the waypoint
+     arrow each carry their own size slider and pass it to `ApplyFont`
+     explicitly, so the shared one is read by nothing -- a third dead control
+     that looked like the two beside it. ]]--
+function OB.LookOptions(styled)
+    --[[ Built here rather than at file scope: `OB.textures`, `OB.fonts` and
+         `OB.borders` are filled in as media is registered, and a list captured
+         before that is a list of nothing. ]]--
+    local rows = {
+        { key = "texture",     row = { "Bar Texture", "texture", OB.textures, 200 } },
+        { key = "font",        row = { "Font", "font", OB.fonts, 200 } },
+        { key = "fontSize",    row = { "Font Size", "fontSize", "slider", 6, 24, 1 } },
+        { key = "fontOutline", row = { "Font Outline", "fontOutline", OB.fontOutlines, 200 } },
+        { key = "border",      row = { "Border", "border", OB.borders, 200 } },
     }
+
+    local out = { { "Appearance", "__h_look", "header" } }
+
+    for i = 1, table.getn(rows) do
+        local entry = rows[i]
+        local wanted = false
+
+        if styled == true then
+            wanted = true
+        elseif type(styled) == "table" then
+            wanted = styled[entry.key] and true or false
+        end
+
+        if wanted then table.insert(out, entry.row) end
+    end
+
+    --[[ A header with nothing under it is worse than no header: it says a
+         section exists and then shows an empty page. ]]--
+    if table.getn(out) == 1 then return {} end
+
+    return out
 end
 
 --[[ Nothing. There is no switch, and that is the point.
@@ -399,9 +843,22 @@ end
      for the same answer. ]]--
 function OB.ScanTooltip()
     if not OB.scanTip then
+        --[==[ **Parented and owned by `UIParent`, which is what everything else
+             does.**
+
+             This was parented to nothing and owned by `WorldFrame`. Every other
+             scanning tooltip in this install -- Atlas-CFM's three, Bagshui's,
+             AceGUI's, LibDBIcon's -- passes `UIParent` for both, and a tooltip
+             that never populates is the failure this shape is suspected of: the
+             lines exist as font strings and stay empty, so a scan reads nil and
+             calls it "no such aura".
+
+             Reported as debuffs with icons and no timers on a unit that was
+             targeted or moused over -- the two states where the exact scan runs
+             and the tooltip is the only source of a name. ]==]
         OB.scanTip = CreateFrame("GameTooltip", "EquadisClassicOverhaulScanTooltip",
-                nil, "GameTooltipTemplate")
-        OB.scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
+                UIParent, "GameTooltipTemplate")
+        OB.scanTip:SetOwner(UIParent, "ANCHOR_NONE")
     end
     return OB.scanTip
 end
@@ -418,14 +875,52 @@ end
      Icon paths are the only identity a 1.12 buff has from Lua -- there is no id
      and the name is localised -- so every buff test in the addon is a texture
      comparison, and they all come through here. ]]--
-function OB.HasPlayerBuff(textures)
-    local i = 0
-    local texture = GetPlayerBuffTexture(i)
+--[==[ **A player buff is found by position and read by handle, and they are not
+     the same number.**
 
-    while texture do
+     `GetPlayerBuff(position, "HELPFUL")` maps the nth helpful buff to the index
+     every other player-buff call wants, and answers -1 past the end. Handing the
+     *position* straight to `GetPlayerBuffTexture` asks a different question of
+     the same shape, and gets it wrong twice over: the index space it walks holds
+     this player's debuffs too, and it stops at the first slot that is not a
+     helpful buff -- so a single debuff can hide every buff behind it.
+
+     Silent, of course. The answer is "you have no such buff", which is what you
+     get for not having it.
+
+     Every other addon in this install resolves the handle first -- BigWigs,
+     BetterCharacterStats and SuperCleveRoidMacros all do, and BigWigs'
+     `CancelAuraTexture` is this loop exactly. So does this now.
+
+     Falls back to the position when the call is missing, which is what a
+     stripped client would leave. ]==]
+local BUFF_POSITIONS = 32
+
+function OB.PlayerBuffIndex(position, harmful)
+    if type(GetPlayerBuff) ~= "function" then return position end
+
+    local index = GetPlayerBuff(position, harmful and "HARMFUL" or "HELPFUL")
+
+    --[[ -1 is the end of the list. Anything else that is not a number is a
+         client that cannot answer, and is treated the same way. ]]--
+    if type(index) ~= "number" or index < 0 then return nil end
+
+    return index
+end
+
+function OB.HasPlayerBuff(textures)
+    local position = 0
+
+    while position < BUFF_POSITIONS do
+        local index = OB.PlayerBuffIndex(position)
+        if not index then return false end
+
+        local texture = GetPlayerBuffTexture(index)
+        if not texture then return false end
+
         if textures[texture] then return true end
-        i = i + 1
-        texture = GetPlayerBuffTexture(i)
+
+        position = position + 1
     end
 
     return false
@@ -576,11 +1071,180 @@ function OB.Ramp(low, half, full, fraction)
     return OB.Blend(low, half, fraction * 2)
 end
 
+--[==[ **A unit's resource, coloured by what it is rather than by who has it.**
+
+     Blizzard colours the power bar by the resource in use, not by class, and the
+     difference matters on exactly the frames that are small: a druid's bar
+     turning yellow is how you know they shifted.
+
+     `ManaBarColor` is the client's own table on 1.12. A few private-server forks
+     expose `UnitPowerType` while stock-era clients have the older `UnitManaType`,
+     so both are tried, and vanilla colours are kept as a fallback -- without one
+     the strip draws as the uncoloured white texture, which is what the party
+     frames were doing.
+
+     Here rather than in a module because the raid frames grew it first and the
+     party frames needed the same answer. Two copies would have been two
+     opinions about what colour rage is. ]==]
+local POWER_FALLBACK = {
+    [0] = { r = 0.00, g = 0.00, b = 1.00 }, -- mana
+    [1] = { r = 1.00, g = 0.00, b = 0.00 }, -- rage
+    [2] = { r = 1.00, g = 0.50, b = 0.25 }, -- focus
+    [3] = { r = 1.00, g = 1.00, b = 0.00 }, -- energy
+    [4] = { r = 0.00, g = 1.00, b = 0.00 }, -- happiness
+}
+
+--[==[ **A bar's text, in whichever of the six shapes was asked for.**
+
+     The unit frames grew these and the party frames were asked for the same
+     ones, so they live here rather than being written twice -- "Current / Max
+     (Percent)" has to mean the same thing on both or the setting is lying about
+     one of them.
+
+     `shorten` and `decimals` are passed rather than read, because they are the
+     one part that is genuinely per-module: the unit frames offer a switch for
+     the thousand-to-ten-thousand band and the party frames need not. Above ten
+     thousand always shortens either way -- five digits do not fit in a bar and
+     nobody reads them, which is not a preference. ]==]
+function OB.ShortValue(value, shorten, decimals)
+    value = value or 0
+    decimals = decimals or 0
+
+    if value > 1000000 then
+        return string.format("%." .. decimals .. "fm", value / 1000000)
+    end
+
+    if value > 10000 then
+        return string.format("%." .. decimals .. "fk", value / 1000)
+    end
+
+    if value > 1000 and shorten then
+        return string.format("%." .. decimals .. "fk", value / 1000)
+    end
+
+    return tostring(OB.Round(value))
+end
+
+--[[ The keys behind `OB.unitTextModes`, in the same order, so a stored index
+     means the same mode wherever it was chosen. ]]--
+OB.unitTextKeys = { "none", "value", "percent", "max", "valuepct", "maxpct" }
+
+function OB.BarText(value, max, mode, shorten, decimals)
+    if mode == "none" then return "" end
+
+    value = value or 0
+    max = max or 0
+
+    local function number(v) return OB.ShortValue(v, shorten, decimals) end
+
+    local function percent()
+        if max == 0 then return "0%" end
+        return math.floor((value / max) * 100 + 0.5) .. "%"
+    end
+
+    if mode == "percent" then return percent() end
+    if mode == "value" then return number(value) end
+    if mode == "max" then return number(value) .. "/" .. number(max) end
+
+    if mode == "valuepct" then
+        return number(value) .. " (" .. percent() .. ")"
+    end
+
+    if mode == "maxpct" then
+        return number(value) .. "/" .. number(max) .. " (" .. percent() .. ")"
+    end
+
+    return number(value)
+end
+
+function OB.PowerType(unit)
+    local kind
+
+    if type(UnitPowerType) == "function" then
+        kind = UnitPowerType(unit)
+    elseif type(UnitManaType) == "function" then
+        kind = UnitManaType(unit)
+    end
+
+    kind = tonumber(kind)
+    if kind == nil then kind = 0 end
+
+    return kind
+end
+
+function OB.PowerColor(unit)
+    local kind = OB.PowerType(unit)
+    local color = ManaBarColor and ManaBarColor[kind]
+
+    if not color then color = POWER_FALLBACK[kind] or POWER_FALLBACK[0] end
+
+    return color.r or color[1] or 0, color.g or color[2] or 0,
+            color.b or color[3] or 1
+end
+
 function OB.ClassColor(class)
     local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
     if not c then c = OB.classColors[class] end
     if not c then return 1, 1, 1 end
     return c.r, c.g, c.b
+end
+
+--[==[ **Whether a unit is a player, in a way that survives them being far away.**
+
+     `UnitIsPlayer` needs an object in the client's world to answer about. A
+     group member on the other side of the zone does not have one, so it answers
+     *no* about somebody who is plainly a player -- and every bar that colours by
+     class fell back to green the moment they walked out of range. The roster has
+     known their class the whole time; it is only the object that is missing.
+
+     So a yes is taken and a no is examined. If the client cannot see the unit at
+     all, its no is a statement about visibility rather than about the unit, and
+     the group roster is the better witness. This is the same rule the mount
+     check and the capability probes follow, for the same reason: an API that can
+     only fail in one direction should only be trusted in the other.
+
+     The token match is what makes trusting the roster safe. `party1` and
+     `raid7` are group members by construction, and a pet's token -- `partypet1`,
+     `raidpet7` -- does not match, because `%d` will not accept the `p`. So a pet
+     out of range still falls through to a no, which is what the party frames
+     wanted `UnitIsPlayer` for in the first place. ]==]
+function OB.IsPlayerUnit(unit)
+    if not unit then return false end
+    if type(UnitIsPlayer) ~= "function" then return false end
+
+    if UnitIsPlayer(unit) then return true end
+
+    --[[ A no from a unit the client can see is a real no. ]]--
+    if type(UnitIsVisible) ~= "function" or UnitIsVisible(unit) then
+        return false
+    end
+
+    return (string.find(unit, "^party%d") or string.find(unit, "^raid%d"))
+            and true or false
+end
+
+--[[ **A unit's class token, asked of the roster when the unit cannot answer.**
+
+     `UnitClass` reads the same object `UnitIsPlayer` does, so it has the same
+     blind spot. For raid members there is a second source that never goes out of
+     range: the roster row itself, whose sixth return is the class token. There
+     is no party equivalent in 1.12, but party members are close enough to the
+     player often enough that `UnitClass` carries them. ]]--
+function OB.UnitClassToken(unit)
+    if not unit then return nil end
+
+    if type(UnitClass) == "function" then
+        local _, token = UnitClass(unit)
+        if token then return token end
+    end
+
+    if type(GetRaidRosterInfo) ~= "function" then return nil end
+
+    local _, _, index = string.find(unit, "^raid(%d+)$")
+    if not index then return nil end
+
+    local _, _, _, _, _, fileName = GetRaidRosterInfo(tonumber(index))
+    return fileName
 end
 
 --[[ **A level's colour is the client's difficulty colour**, which says something
@@ -637,22 +1301,6 @@ OB.moduleOrder = {}  -- registration order, which is also panel order
 OB.bound = {}        -- slotId -> descriptor
 OB.eventMap = {}     -- event -> { descriptor, ... }
 OB.dragMap = {}      -- frame -> slotId
-
---[[ Cross-cutting notifications, ShaguDPS's parser.callbacks.refresh. Phase 1
-     has a single subscriber, but this is the seam the combat log parser and the
-     meters join at later, so it exists from the start. ]]--
-OB.callbacks = { refresh = {} }
-
-function OB.Subscribe(list, fn)
-    table.insert(OB.callbacks[list], fn)
-end
-
-function OB.Fire(list)
-    local subs = OB.callbacks[list]
-    for i = 1, table.getn(subs) do
-        subs[i]()
-    end
-end
 
 --[[ Register a module.
 
@@ -859,3 +1507,162 @@ OB.coreEvents = {
     "PLAYER_ALIVE",
     "PLAYER_UNGHOST",
 }
+
+-- ---------------------------------------------------------------------------
+-- addons this one has absorbed
+-- ---------------------------------------------------------------------------
+
+--[[ **An all-in-one that is merging other addons in has to notice when the
+     addon it replaced is still switched on.**
+
+     Two addons that both restyle a Blizzard frame do not politely share it.
+     They race: whichever installs its hook last owns the frame, and the loser's
+     settings quietly stop changing pixels. Nothing errors, so it reads as "the
+     module is broken" rather than "two things are fighting". This install hit
+     exactly that -- Unit Frames, its own standalone ancestor and
+     DragonflightUI were all switched on together, and the standalone kept the
+     target frame art because it takes FrameXML functions this module did not.
+
+     Only *loaded* addons are worth mentioning; a disabled one cannot fight.
+     And the warning is tied to the module that supersedes it, so somebody who
+     has deliberately turned ECO's Unit Frames off to keep the standalone is not
+     nagged about a conflict they chose. ]]--
+OB.supersededAddOns = {
+    { addon = "EquadisUnitFrames",  feature = "unitframes", label = "UnitFrames" },
+    { addon = "EquadisOmniBars",    feature = "actionbars", label = "Action Bars" },
+    { addon = "EquadisChatTweaks",  feature = "chat",       label = "Chat" },
+    { addon = "EquadisThreatMeter", feature = "threat",     label = "Threat" },
+    { addon = "UnitFramesImproved_Vanilla", feature = "unitframes", label = "UnitFrames" },
+
+    --[[ **DragonflightUI-Reforged, once per thing it takes over.**
+
+         Not an Equadis addon, but it replaces whole swathes of the interface
+         and this project has been removing its remnants rather than living
+         alongside it.
+
+         It was listed here for unit frames only, while the comment beside it
+         said "unit frames *and action bars*" -- the sentence knew about a
+         conflict the data did not, so nothing was ever said about the bars. It
+         has a `map` module too, and `bags`, and `chat`, and a cast bar. Every
+         one of those is a frame two addons now both believe they own, and the
+         loser does not error: it simply stops changing pixels, which reads as
+         "that module is broken".
+
+         One row per module, because the warning names which of ECO's parts is
+         being fought over and a single row could only name one. ]]--
+    { addon = "DragonflightUI-Reforged", feature = "unitframes", label = "UnitFrames" },
+    { addon = "DragonflightUI-Reforged", feature = "actionbars", label = "Action Bars" },
+    { addon = "DragonflightUI-Reforged", feature = "map",        label = "Map" },
+    { addon = "DragonflightUI-Reforged", feature = "chat",       label = "Chat" },
+    { addon = "DragonflightUI-Reforged", feature = "bags",       label = "Bags" },
+
+    --[[ **ShaguTweaks is a bundle, and one mod in it moves the same frames.**
+
+         "Movable Unit Frames" watches every frame for Shift and Control held
+         together and, while they are, makes `PlayerFrame` and `TargetFrame`
+         draggable -- then takes the drag scripts away again on release.
+
+         That collides with this addon twice over. ECO's edit mode gesture is
+         Control-Shift-Alt, which *contains* Control-Shift, so unlocking here
+         unlocks there as well; and ECO owns whether those frames are movable,
+         so their `StartMoving` lands on a frame ECO has locked and throws
+         "Frame PlayerFrame is not movable or resizable".
+
+         Detected precisely rather than by name: ShaguTweaks records each mod in
+         `ShaguTweaks_config` by title, `1` for on. Warning about the whole
+         addon would be wrong for anybody who has already switched this one
+         piece off. ]]--
+    { addon = "ShaguTweaks", feature = "unitframes", label = "UnitFrames",
+      detect = function()
+          return ShaguTweaks_config
+                  and ShaguTweaks_config["Movable Unit Frames"] == 1
+      end },
+    { addon = "DragonflightUI-Reforged", feature = "partyframes", label = "Party Frames" },
+}
+
+function OB.ConflictingAddOns()
+    local found = {}
+    if type(IsAddOnLoaded) ~= "function" then return found end
+
+    for i = 1, table.getn(OB.supersededAddOns) do
+        local entry = OB.supersededAddOns[i]
+
+        --[[ `ModuleEnabled` is asked rather than assumed true, so this stays
+             quiet for a module the user turned off on purpose. ]]--
+        if IsAddOnLoaded(entry.addon) and OB.ModuleEnabled(entry.feature) then
+            --[[ **A modular neighbour is asked which parts are switched on.**
+
+                 Some addons are a bundle of small mods rather than one thing,
+                 and only one of those mods may touch the same frames. Warning
+                 about the whole addon would be wrong for everybody who has
+                 already turned that one piece off -- and a warning that is
+                 wrong is a warning people stop reading.
+
+                 An entry without a `detect` is the ordinary case: the addon
+                 being loaded at all is the conflict. ]]--
+            local conflicts = true
+
+            if entry.detect then
+                local ok, answer = pcall(entry.detect)
+                conflicts = ok and answer and true or false
+            end
+
+            if conflicts then table.insert(found, entry) end
+        end
+    end
+
+    return found
+end
+
+--[[ Once a session. PLAYER_ENTERING_WORLD fires again on every loading screen,
+     and a warning that reprints each time you step into an instance is a
+     warning people learn to scroll past. ]]--
+function OB.WarnConflicts()
+    if OB.conflictsWarned then return false end
+
+    local found = OB.ConflictingAddOns()
+    if table.getn(found) == 0 then return false end
+
+    OB.conflictsWarned = true
+
+    for i = 1, table.getn(found) do
+        local entry = found[i]
+        OB.Print("|cffff8080" .. entry.addon .. "|r is still enabled and is "
+                .. "fighting the " .. entry.label .. " module for the same "
+                .. "frames. Turn it off in |cffffd100/addons|r and reload.")
+    end
+
+    return true
+end
+
+--[[ **The profiler's entry points, defined here so they are never nil.**
+
+     `profiler.lua` overwrites every one of these when it loads. If it does not
+     load, these stay and say so.
+
+     This exists because guarding the call site was not enough. `/eq perf`
+     shipped calling `OB.ToggleProfile` on a build where the file defining it
+     was newly added to the TOC, and **1.12 does not reliably pick up a newly
+     added file on `/reload`** -- so the command existed, the function did not,
+     and typing it threw. Guarding that one call fixed that one call and left
+     the shape of the bug in place: any later command pointing at a file that
+     did not load fails the same way.
+
+     A name the dispatcher calls should exist from the moment the addon is
+     loaded, whatever else did or did not happen after. Load order is then a
+     thing that changes the message, not a thing that throws. ]]--
+local function ProfilerMissing()
+    OB.Print("the profiler did not load. If this addon was just updated, log "
+            .. "out to the desktop and back in -- adding a file needs a full "
+            .. "restart, and reloading is not enough.", "Profile")
+    return false
+end
+
+OB.StartProfile = ProfilerMissing
+OB.StopProfile = ProfilerMissing
+OB.ReportProfile = ProfilerMissing
+OB.ToggleProfile = ProfilerMissing
+
+--[[ Set by profiler.lua on load. `/eq doctor` reports it, because "did the file
+     load" is the first question worth answering when a command misbehaves. ]]--
+OB.profilerLoaded = false

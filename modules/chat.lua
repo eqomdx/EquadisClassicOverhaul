@@ -33,18 +33,75 @@ local OB = EquadisClassicOverhaul
 
      nil means the file never compiled: a syntax error, which on 1.12 means
      something Lua 5.0 rejects and 5.1 accepts. Any number means it started, and
-     which number says where it stopped. `/eqob doctor` reports it. ]]--
+     which number says where it stopped. `/eq doctor` reports it. ]]--
 OB.chatLoad = 10
 
 -- ---------------------------------------------------------------------------
 -- timestamps
 -- ---------------------------------------------------------------------------
 
---[[ 1.12 has seven chat windows, and the number is fixed rather than discovered:
-     NUM_CHAT_WINDOWS exists but a stub or a future client could disagree with
-     the frames that actually exist, and a hook on a missing frame is an error
-     rather than a no-op. ]]--
-local WINDOWS = 7
+--[==[ **A setting per window, shown only for the windows you have.**
+
+     Three lists on this page are one row repeated per index -- a timestamp
+     switch per chat window, a search box per chat window, and a mention switch
+     per numbered channel. Twenty-four rows, and for almost everybody twenty of
+     them are about something that does not exist: 1.12 builds seven chat frames
+     and docks two, and nobody is in ten custom channels.
+
+     Behaving instead of hiding was the alternative and it is worse. The
+     settings are all still there and still saved; make a third window and its
+     row comes back holding whatever it held. What goes is the offer to
+     configure a thing you do not have.
+
+     `dependsOn` rather than `greyWhen`, which is the distinction the panel
+     already draws: a greyed row still means something and is not in charge,
+     while a row for a window nobody made means nothing at all. ]==]
+
+--[[ The trailing number off `stamp.3` or `popupChannel.7`. 1.12's Lua has no
+     `string.match`, so the capture comes back through `string.find`. ]]--
+local function rowIndex(w)
+    if not w or not w.key then return nil end
+
+    local _, _, digits = string.find(w.key, "(%d+)$")
+
+    return tonumber(digits)
+end
+
+OB.predicates = OB.predicates or {}
+
+OB.predicates.chat_window_live = function(w)
+    local index = rowIndex(w)
+    if not index then return true end
+
+    --[[ The first two are the client's own -- General and the combat log -- and
+         are docked from a fresh install, so they are never in question. ]]--
+    if index <= 2 then return true end
+
+    local frame = getglobal("ChatFrame" .. index)
+    if not frame then return false end
+
+    --[[ Docked *or* shown. An undocked window somebody has dragged off on its
+         own is still a window they made, and asking only about the dock would
+         take its settings away for having been moved. ]]--
+    if frame.isDocked then return true end
+    if frame.IsShown and frame:IsShown() then return true end
+
+    return false
+end
+
+OB.predicates.chat_channel_joined = function(w)
+    local index = rowIndex(w)
+    if not index then return true end
+
+    --[[ Answering yes when the call is missing, because a panel that hides rows
+         on a client it cannot ask is worse than one that shows a few too
+         many. ]]--
+    if type(GetChannelName) ~= "function" then return true end
+
+    local _, name = GetChannelName(index)
+
+    return (name and name ~= "") and true or false
+end
 
 
 
@@ -154,8 +211,8 @@ OB.chatOptions = {
         { "Font", "font", OB.fonts, 200,
           nil, nil, nil, nil, "!restyle" },
 
-        { "Font Outline", "fontOutline", "boolean",
-          nil, nil, nil, nil, nil, "!restyle" },
+        { "Font Outline", "fontOutline", OB.fontOutlines, 150,
+          nil, nil, nil, nil, "!restyle" },
 
         { "Font Size", "fontSize", "slider", 6, 24, 1,
           nil, nil, "!restyle" },
@@ -203,13 +260,20 @@ OB.chatOptions = {
 
         { "Timestamps", "__s_stamps", "section", "stamps" },
 
-        { "Chat Window 1", "stamp.1", "boolean" },
-        { "Chat Window 2", "stamp.2", "boolean" },
-        { "Chat Window 3", "stamp.3", "boolean" },
-        { "Chat Window 4", "stamp.4", "boolean" },
-        { "Chat Window 5", "stamp.5", "boolean" },
-        { "Chat Window 6", "stamp.6", "boolean" },
-        { "Chat Window 7", "stamp.7", "boolean" },
+        { "Chat Window 1", "stamp.1", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 2", "stamp.2", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 3", "stamp.3", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 4", "stamp.4", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 5", "stamp.5", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 6", "stamp.6", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
+        { "Chat Window 7", "stamp.7", "boolean",
+          nil, nil, nil, nil, "@chat_window_live" },
 
         --[[ Whose clock first, then what it looks like -- the source is the
              bigger decision and the format reads as a refinement of it. ]]--
@@ -281,31 +345,75 @@ OB.chatOptions = {
 
         { "Links", "__s_links", "section", "links" },
 
-        { "Make Links Clickable", "urlCopy", "boolean" },
+        --[==[ **There is no Make Links Clickable switch.** Links always are.
+
+             1.12 cannot select text out of a chat frame, so the click that opens
+             a copy box is the only way a URL gets off the screen without being
+             typed out by hand. Off was not a preference; it was the address bar
+             taken away.
+
+             The two rows below stay, because how a link is *wrapped* is a real
+             question with more than one right answer. ]==]
         --[[ The same three the player-name row offers, from the same list, because
              "how is a thing wrapped" is one question and answering it two ways
              on one page is two things to learn. ]]--
-        { "Surround Links With", "urlBrackets", OB.nameBrackets, 160,
-          nil, nil, nil, nil, "!urlCopy" },
-        { "Link Color", "urlColor", "color", true,
-          nil, nil, nil, nil, "!urlCopy" },
+        { "Surround Links With", "urlBrackets", OB.nameBrackets, 160 },
+        { "Link Color", "urlColor", "color", true },
 
         { "Scrolling", "__s_scroll", "section", "scroll" },
 
-        { "Scroll With The Mouse Wheel", "wheel", "boolean" },
-        { "Lines Per Notch", "wheelLines", "slider", 1, 21, 1,
-          nil, nil, "!wheel" },
-        { "Lines Per Notch Holding Ctrl", "wheelFast", "slider", 1, 21, 1,
-          nil, nil, "!wheel" },
+        --[==[ **There is no wheel switch.** The wheel scrolls.
 
-        --[[ Not gated by the switch above: how much is kept is worth setting
-             whether or not the wheel is what gets you there. ]]--
+             1.12 wires no wheel to a chat frame at all -- the client wants you
+             to drag the scrollbar -- so off was not "scroll some other way", it
+             was the 2005 behaviour back, and the defaults note said as much:
+             the one setting here where off is the surprising state.
+
+             How far a notch goes is still a question, so the two sliders stay
+             and are no longer gated on a switch that cannot be off. ]==]
+        { "Lines Per Notch", "wheelLines", "slider", 1, 21, 1 },
+        { "Lines Per Notch Holding Ctrl", "wheelFast", "slider", 1, 21, 1 },
+
         { "Lines Kept", "scrollback", "slider", 50, 500, 10 },
+
+        --[[ Only while there is something below to go back to. A button that is
+             always there is a button that means nothing when it appears. ]]--
+        { "Jump To Newest Button", "jumpButton", "boolean" },
 
         { "Hide Scroll Arrows", "hideButtons", "boolean" },
         { "Hide Chat Menu Button", "hideMenuButton", "boolean" },
 
-        { "Remember Channel Colors By Name", "rememberColors", "boolean" },
+        --[[ **The one setting here that writes what people say to disk**, so it
+             is grouped and labelled as what it is rather than tucked in among
+             the scroll controls. See the note on `history` in the defaults. ]]--
+        { "Keep History Across Reloads", "__s_history", "section", "history" },
+
+        { "Keep History", "history", "boolean" },
+        { "Hide Macro Directives", "hideMacroDirectives", "boolean" },
+        { "Lines Kept Per Window", "historyLines", "slider", 20, 500, 10,
+          nil, nil, "!history" },
+
+        --[[ Shown as a percentage of the line's own colour, because that is
+             what it is -- not a brightness in the abstract. ]]--
+        { "History Brightness", "historyDim", "slider", 20, 100, 5, 0.01,
+          nil, "!history" },
+
+        { "Forget Kept History", "__a_forget", "action",
+          function() OB.modules.chat:ForgetHistory() end,
+          function() return "Forget Kept History" end },
+
+        --[==[ **Channel colours are always remembered by name.**
+
+             1.12 stores a channel's colour by its number and the numbers move:
+             leave one channel and everything below it shifts up, wearing the
+             wrong colours. Off did not give anybody a choice, it gave them the
+             shuffle -- and the defaults note already said this one is invisible
+             when it works, which is the description of something that should
+             not be a switch. ]==]
+
+        --[[ On by default, which almost nothing here is. See the note on
+             `hideAwayReplies` in the defaults for why this one earns it. ]]--
+        { "Hide 'Player Is Away' Replies", "hideAwayReplies", "boolean" },
 
         { "Player Names", "__s_names", "section", "names" },
 
@@ -392,30 +500,30 @@ OB.chatOptions = {
              happen to share a naming scheme, and wanting one of them is not
              wanting all three. ]]--
         { "Channel 1", "popupChannel.1", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 2", "popupChannel.2", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 3", "popupChannel.3", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 4", "popupChannel.4", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 5", "popupChannel.5", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 6", "popupChannel.6", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 7", "popupChannel.7", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 8", "popupChannel.8", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 9", "popupChannel.9", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
         { "Channel 10", "popupChannel.10", "boolean",
-          nil, nil, nil, nil, nil, "!popup" },
+          nil, nil, nil, nil, "@chat_channel_joined", "!popup" },
 
         { "Seconds On Screen", "popupSeconds", "slider", 3, 30, 1,
           nil, nil, "!popup" },
         { "Scale", "popupScale", "slider", 50, 200, 5, 0.01,
-          nil, nil, "!popup" },
+          nil, "!popup" },
         { "Text Size", "popupTextSize", "slider", 8, 32, 1,
           nil, nil, "!popup" },
         { "Play A Sound", "popupSound", "boolean",
@@ -478,19 +586,19 @@ OB.chatOptions = {
         { "Show Search Box", "showSearchBox", "boolean" },
 
         { "Chat Window 1", "searchWindow.1", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 2", "searchWindow.2", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 3", "searchWindow.3", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 4", "searchWindow.4", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 5", "searchWindow.5", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 6", "searchWindow.6", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
         { "Chat Window 7", "searchWindow.7", "boolean",
-          nil, nil, nil, nil, nil, "!showSearchBox" },
+          nil, nil, nil, nil, "@chat_window_live", "!showSearchBox" },
 
         { "Lines Remembered Per Window", "searchLines", "slider", 100, 2000, 100,
           nil, nil, "!showSearchBox" },
@@ -501,7 +609,9 @@ OB.chatOptions = {
 
 OB.chatLoad = 20
 
-local M = OB.RegisterModule({
+--[[ Not kept in a local: the behaviour is in chatbehaviour.lua, which takes
+     the module back out of the registry by id. ]]--
+OB.RegisterModule({
     id = "chat",
     name = "Chat",
 
@@ -515,7 +625,22 @@ local M = OB.RegisterModule({
     --[[ Ships off. It hooks the chat frames, and anything that touches chat
          should be a decision rather than a surprise -- particularly next to
          another chat addon, which is the common case. ]]--
-    defaultEnabled = false,
+    --[==[ **On, like everything else.**
+
+         This module shipped off. So did twelve others, which meant a fresh
+         install of this addon did very nearly nothing until somebody went
+         through the Modules page switching things on -- and nothing on screen
+         said that was the step they were missing. It was reported as settings
+         not carrying across to a new character, which is what an addon that is
+         installed and not running looks like from outside.
+
+         The flag exists for a feature that is not finished, where drawing
+         nothing is indistinguishable from being broken. None of the thirteen
+         were that; they were caution, and the setup walkthrough is where that
+         caution belongs now -- it goes through every module in turn and offers
+         exactly this switch, with a description of what the module does. A
+         decision somebody is walked through is better than a default they never
+         find. ]==]
 
     defaults = {
         --[[ Per window, because people use window one for everything and window
@@ -661,7 +786,7 @@ local M = OB.RegisterModule({
              the rest of the addon and changing it here changes only chat. It
              goes through `OB.Look`, which is what makes that true. ]]--
         font = OB.fontIndex["Roboto"] or 1,
-        fontOutline = false,
+        fontOutline = 1,   -- None
         fontSize = 12,
 
         --[[ The window itself rather than its text. One is where the client
@@ -763,8 +888,7 @@ local M = OB.RegisterModule({
              1.12 cannot open a browser and never will, so "clickable" means a
              box you can select the text out of. That is the whole feature and it
              is worth having: the alternative is copying a URL off the screen by
-             hand, one character at a time. ]]--
-        urlCopy = true,
+             hand, one character at a time -- which is why it has no switch. ]]--
         urlBrackets = 1,
         urlColor = { 0.35, 0.70, 1.00, 1 },
 
@@ -774,17 +898,15 @@ local M = OB.RegisterModule({
              1.12 stores a channel's colour by its *number*, and the numbers move
              -- leave one channel and everything below it shifts up, taking your
              colours with it. Remembering by name is the fix and it is invisible
-             when it works, which is why it is on. ]]--
-        rememberColors = true,
+             when it works, which is why it has no switch. ]]--
 
         --[[ **Scrollback**, from Prat's Scroll and History -- two modules, but
              one subject: how far back you can read and how fast you get there.
 
              On by default, and the only thing in this file that is. 1.12's chat
              frames are not wheel-scrollable at all: the client wants you to drag
-             the scrollbar, which nobody has done since 2005. This is the one
-             behaviour where off is the surprising state. ]]--
-        wheel = true,
+             the scrollbar, which nobody has done since 2005. Off was the one
+             state nobody was asking for, so there is no longer a way to ask. ]]--
 
         --[[ One notch, one line, because a chat window is not a document -- you
              scroll it to re-read the thing that just went past. Ctrl is the
@@ -797,6 +919,74 @@ local M = OB.RegisterModule({
              keep more of, which is not worth six extra rows -- the cost of a
              larger number is memory, and 500 lines of text is nothing. ]]--
         scrollback = 128,
+
+        --[[ **The way back down**, which 1.12 does not offer at all: scroll up
+             to read something and the only ways back are the wheel, the arrow,
+             or a new message arriving.
+
+             On by default and shown only while scrolled up, so it costs nothing
+             to somebody who never scrolls -- and the switch is here because a
+             button that appears over the chat window is exactly the kind of
+             thing somebody will want gone. ]]--
+        jumpButton = true,
+
+        --[[ **The away reply, which the client sends you every single time.**
+
+             Whisper somebody who is AFK or on Do Not Disturb and the server
+             sends their auto-reply back -- "Player is Away: gone for food" --
+             as `CHAT_MSG_AFK` or `CHAT_MSG_DND`. Once is useful. The client
+             sends it on *every* whisper, so a conversation with somebody who
+             forgot to clear their AFK is your message, their away notice, your
+             message, their away notice, and the actual conversation pushed off
+             the top of the window.
+
+             **The `<AFK>` marker beside their name is untouched**, and that is
+             the point rather than a caveat: the marker is drawn from
+             `CHAT_FLAG_AFK` on their own lines and has nothing to do with these
+             two events. You still know they are away. You are just not told
+             again every time you speak.
+
+             On by default -- one of very few things here that is -- because the
+             information is not lost, only the repetition, and nobody has ever
+             wanted the fourth copy. ]]--
+        hideAwayReplies = true,
+
+        --[[ **Scrollback that survives a reload**, from Prat's History.
+
+             1.12 empties every chat window on `/reload` and on logout, so the
+             conversation you were in the middle of is simply gone -- and reload
+             is something you do constantly while configuring an addon. Prat
+             replayed what it had seen, and the thing that made it work rather
+             than merely exist was drawing the replayed lines *darker*: history
+             you can read and never mistake for something that just arrived.
+
+             **Off by default, and deliberately.** This is the one setting in
+             the addon that writes what people say to disk. Everything else here
+             rearranges pixels; this keeps a copy of your conversations in a
+             SavedVariables file that anybody with the machine can read. That is
+             a reasonable thing to want and an unreasonable thing to turn on for
+             somebody without asking, which is the same line the edit box
+             history draws when it refuses to persist what you typed. ]]--
+        history = false,
+
+        --[[ **Never say a macro directive out loud.** 1.12 has no
+             `#showtooltip`, so the client says any line it cannot run. See
+             `IsMacroDirective`. ]]--
+        hideMacroDirectives = true,
+
+        --[[ Per window. A hundred lines is a few screens -- enough to pick a
+             conversation back up, short enough that the file stays small and
+             the replay is instant. ]]--
+        historyLines = 100,
+
+        --[[ How much darker, as a fraction of the line's own colour. Scaling
+             the colour rather than replacing it keeps a whisper pink and a
+             party line blue, which is the whole point: you can still tell what
+             kind of line it was, it is just visibly *past*.
+
+             0.55 is dim enough to read as history at a glance and bright enough
+             to actually read. ]]--
+        historyDim = 0.55,
 
         --[[ **Player names**, from Prat's PlayerNames.
 

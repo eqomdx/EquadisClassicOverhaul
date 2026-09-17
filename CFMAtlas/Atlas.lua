@@ -35,7 +35,7 @@ local Colors = AtlasCFM.Colors
 -- Atlas-CFM if this source tree is used that way.
 AtlasCFM.Version = GetAddOnMetadata(AtlasCFM.Name, "Version")
         or GetAddOnMetadata("EquadisClassicOverhaul", "X-AtlasCFM-Version")
-        or "1.60"
+        or "1.70"
 
 ---
 --- Outputs debug information to chat if debug mode is enabled
@@ -223,10 +223,9 @@ local function Atlas_Init()
 	-- Initialize UI frames
 	AtlasCFMLoot_InitializeUI()
 
-	--clear saved vars for a new ver (or a new install!)
-	if AtlasCFMOptions == nil or AtlasCFMCharDB.FirstTime then -- or AtlasCFMOptions["AtlasVersion"] ~= AtlasCFM.Version
-		AtlasCFM.OptionDefaultSettings()
-	end
+	-- Initialize/migrate saved variables non-destructively.
+	-- FirstTime is per-character and must never reset account-wide options.
+	AtlasCFM.EnsureSavedOptions()
 
 	--populate the dropdown lists
 

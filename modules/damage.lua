@@ -18,6 +18,8 @@
 
 local OB = EquadisClassicOverhaul
 
+local function Say(msg) OB.Print(msg, "Damage") end
+
 -- ---------------------------------------------------------------------------
 -- the running totals
 -- ---------------------------------------------------------------------------
@@ -46,6 +48,10 @@ local function newSegment(now)
         damage = {}, heal = {}, taken = {},
         spells = { damage = {}, heal = {}, taken = {} },
         started = now, last = now,
+
+        --[[ Bumped by every line added. `OB.DamageRows` sorts against it, so
+             it is what tells a redraw whether anything actually changed. ]]--
+        revision = 0,
     }
 end
 
@@ -72,6 +78,10 @@ end
      duration is the span that actually had damage in it. Idle time between pulls
      would otherwise divide into the rate and make everyone look worse the longer
      they stood still. ]]--
+--[[ The two segments every line is added to, held rather than rebuilt -- see
+     the note where it is filled in. ]]--
+local segments = {}
+
 function OB.AddCombatLine(data, line, now)
     if not data or not line then return end
     if not line.amount or line.amount <= 0 then return end
@@ -83,8 +93,14 @@ function OB.AddCombatLine(data, line, now)
          the breakdown would omit most of a warrior's damage. ]]--
     local spell = line.spell or "Melee"
 
-    local segments = { data.overall, data.current }
-    for i = 1, table.getn(segments) do
+    --[[ Reused rather than built. This runs for every combat line in the game,
+         and in a raid a fresh two-element table per line is hundreds of tables a
+         second thrown away immediately -- the garbage that is paid for later as
+         a collection pause rather than now as CPU. ]]--
+    segments[1] = data.overall
+    segments[2] = data.current
+
+    for i = 1, 2 do
         local segment = segments[i]
 
         segment[bucket][line.source] =
@@ -103,6 +119,7 @@ function OB.AddCombatLine(data, line, now)
         end
 
         segment.last = now
+        segment.revision = (segment.revision or 0) + 1
     end
 end
 
@@ -168,31 +185,104 @@ end
      and rate is the same ordering divided by a constant -- except for somebody
      who joined late, where rate flatters them for having been there less. Name
      breaks a tie so the list does not shuffle between identical readings. ]]--
+--[[ **Hoisted, because a fresh closure per call is an allocation per redraw.**
+     It captures nothing, so there was never a reason to build it each time. ]]--
+local function byTotal(a, b)
+    if a.total == b.total then return a.name < b.name end
+    return a.total > b.total
+end
+
+--[[ **The rows a window draws, rebuilt only when the numbers change.**
+
+     This was the single largest allocator in the addon: measured over twenty
+     minutes it produced 16 MB across 3085 draws -- 5.3 kB every redraw -- and
+     the redraw happens whether or not anything happened. Each call built a
+     fresh list, a fresh table per player in it, and a fresh comparator, then
+     sorted the lot. Out of combat, staring at a meter nobody was feeding, it
+     did all of that several times a second to produce an identical answer.
+
+     So the sorted list is kept and rebuilt only when `segment.revision` moves,
+     which `OB.AddCombatLine` bumps for every line. The row tables are reused
+     rather than reallocated, so a rebuild costs the sort and nothing else.
+
+     **The returned table is shared, not a copy.** It is the same table next
+     call, and its contents change underneath anyone holding it. The only
+     caller draws from it immediately and keeps nothing, which is what makes
+     this safe -- a second caller that stored it would need a copy. ]]--
 function OB.DamageRows(segment, bucket)
-    local rows = {}
-    if not segment then return rows end
+    --[[ A fresh table for the empty case rather than a shared one. It is off
+         the hot path entirely, so there is nothing to win by sharing it and a
+         caller that decided to mutate it would be someone else's afternoon. ]]--
+    if not segment then return {} end
 
-    local totals = segment[bucket] or {}
-    local sum = 0
+    local caches = segment.rowCache
 
-    for name, amount in pairs(totals) do
-        table.insert(rows, { name = name, total = amount })
-        sum = sum + amount
+    if not caches then
+        caches = {}
+        segment.rowCache = caches
     end
 
-    local duration = OB.SegmentDuration(segment)
+    local entry = caches[bucket]
 
-    for i = 1, table.getn(rows) do
-        rows[i].perSecond = rows[i].total / duration
-        rows[i].share = sum > 0 and (rows[i].total / sum) or 0
+    if not entry then
+        entry = { rows = {}, revision = -1, sum = 0 }
+        caches[bucket] = entry
     end
 
-    table.sort(rows, function(a, b)
-        if a.total == b.total then return a.name < b.name end
-        return a.total > b.total
-    end)
+    local revision = segment.revision or 0
 
-    return rows
+    if entry.revision ~= revision then
+        local rows = entry.rows
+        local totals = segment[bucket] or {}
+        local sum = 0
+        local count = 0
+
+        for name, amount in pairs(totals) do
+            count = count + 1
+
+            local row = rows[count]
+            if not row then
+                row = {}
+                rows[count] = row
+            end
+
+            row.name = name
+            row.total = amount
+            sum = sum + amount
+        end
+
+        --[[ Trimmed from the end, or a segment that lost a name would keep
+             drawing the row that name used to occupy. ]]--
+        for i = table.getn(rows), count + 1, -1 do
+            rows[i] = nil
+        end
+
+        table.sort(rows, byTotal)
+
+        --[[ **Derived here rather than on every call**, because both of these
+             follow the data and not the clock.
+
+             That is worth stating, because the opposite is the obvious guess:
+             a rate looks like something that should fall while you stand still.
+             It does not. `OB.SegmentDuration` is `last - started`, and `last`
+             moves only when a line lands -- deliberately, so idle time between
+             pulls does not divide into the rate and make everyone look worse
+             for having stopped. Duration therefore changes exactly when the
+             revision changes, and there is nothing here a redraw could learn
+             by recomputing. ]]--
+        local duration = OB.SegmentDuration(segment)
+
+        for i = 1, count do
+            local row = rows[i]
+            row.perSecond = row.total / duration
+            row.share = sum > 0 and (row.total / sum) or 0
+        end
+
+        entry.revision = revision
+        entry.sum = sum
+    end
+
+    return entry.rows
 end
 
 -- ---------------------------------------------------------------------------
@@ -202,6 +292,44 @@ end
 --[[ What one window shows. A meter is several windows over one set of totals --
      damage in one, healing beside it -- so everything that differs between them
      lives here and everything that is counted lives in the data above. ]]--
+--[==[ **A window cannot be narrower than its own header.**
+
+     The strip is three groups: two icons at the left edge, two menus centred on
+     the midline, two icons at the right. The menus are placed from the centre
+     and the icons from the edges, so nothing in that layout notices when they
+     meet -- they simply draw on top of each other, and the result is a header
+     with the cog sitting in the middle of the word `Current` and the reset and
+     the plus nowhere to be seen.
+
+     The floor was 100, which is a round number rather than a measurement. It is
+     measured here instead: the two groups of icons, the pair of menus, and one
+     gap between each so the centred pair does not touch what it is centred
+     between. Written once and read by the slider, the resize grip and the styler
+     alike -- three places that were each free to disagree, and the reason a
+     window could be dragged to a width the panel would not have offered.
+
+     The numbers are the widths those buttons are actually built at:
+     `OB.IconButton` is sixteen wide and `headerButton` is asked for
+     fifty-six. ]==]
+local HEADER_ICON_W = 16
+local HEADER_MENU_W = 56
+local HEADER_GAP = 2
+
+local MIN_WINDOW_W =
+        -- lock, cog
+        (HEADER_GAP + HEADER_ICON_W + HEADER_GAP + HEADER_ICON_W)
+        -- clear of the centred pair
+        + HEADER_GAP * 2
+        -- segment, mode
+        + (HEADER_MENU_W + HEADER_GAP + HEADER_MENU_W)
+        + HEADER_GAP * 2
+        -- reset, new (or close)
+        + (HEADER_ICON_W + HEADER_GAP + HEADER_ICON_W + HEADER_GAP)
+
+local MAX_WINDOW_W = 500
+
+function OB.MeterMinWidth() return MIN_WINDOW_W end
+
 local function newWindow(x, y)
     return {
         mode = "damage",
@@ -242,7 +370,22 @@ local M = OB.RegisterModule({
     id = "damage",
     name = "Damage Meter",
     feature = true,
-    defaultEnabled = false,
+    --[==[ **On, like everything else.**
+
+         This module shipped off. So did twelve others, which meant a fresh
+         install of this addon did very nearly nothing until somebody went
+         through the Modules page switching things on -- and nothing on screen
+         said that was the step they were missing. It was reported as settings
+         not carrying across to a new character, which is what an addon that is
+         installed and not running looks like from outside.
+
+         The flag exists for a feature that is not finished, where drawing
+         nothing is indistinguishable from being broken. None of the thirteen
+         were that; they were caution, and the setup walkthrough is where that
+         caution belongs now -- it goes through every module in turn and offers
+         exactly this switch, with a description of what the module does. A
+         decision somebody is walked through is better than a default they never
+         find. ]==]
     renders = "window",
     tickly = true,
 
@@ -268,7 +411,26 @@ local M = OB.RegisterModule({
 
         mergePets = true,
         trackAll = false,
+
+        --[[ **The Overall segment is the one nobody remembers to reset.**
+
+             `current` starts fresh at every pull and looks after itself.
+             `overall` runs until somebody clears it -- which is the point of it
+             -- so it quietly accumulates across an evening, and the first pull
+             of a raid ends up measured against three hours of trash from the
+             dungeon before it.
+
+             On by default, because it asks rather than acts and the question is
+             a good one at exactly that moment. It is only raised when the
+             overall segment actually has something in it: asking whether to
+             reset a meter reading zero is a dialog that can only waste a
+             click. ]]--
+        askResetInInstance = true,
         resetOnPull = true,
+
+        --[[ Seconds out of combat before the next pull counts as a new fight.
+             See `StartsNewFight`. ]]--
+        fightGap = 5,
 
         --[[ Redraws per second. Per-second figures keep moving between events --
              the totals only change on a hit, but the seconds they are divided
@@ -295,11 +457,16 @@ local M = OB.RegisterModule({
     options = {
         { "Window", "__s_window", "section", "window" },
         { "Reset On Pull", "resetOnPull", "boolean" },
+        { "Seconds Between Fights", "fightGap", "slider", 1, 30, 1 },
+
+        --[[ Asks rather than acts, and only when the overall segment has
+             something in it. See the note on `askResetInInstance`. ]]--
+        { "Ask To Reset Overall In A Dungeon", "askResetInInstance", "boolean" },
         --[[ Nearby *players*, told from mobs by the roster -- so an unswept
              realm sees fewer of them and the Chat Scan is what fills that in. ]]--
         { "Track Nearby Players", "trackAll", "boolean" },
         { "Updates Per Second", "updateRate", "slider", 1, 10, 1 },
-        { "Width", "windows.1.width", "slider", 100, 500, 1 },
+        { "Width", "windows.1.width", "slider", MIN_WINDOW_W, MAX_WINDOW_W, 1 },
         { "Rows Shown", "windows.1.rows", "slider", 3, 40, 1 },
         { "X Position", "windows.1.x", "slider", -2000, 2000, 1 },
         { "Y Position", "windows.1.y", "slider", -2000, 2000, 1 },
@@ -351,6 +518,12 @@ local function damageEvents()
 
     table.insert(events, "PLAYER_REGEN_DISABLED")
     table.insert(events, "PLAYER_REGEN_ENABLED")
+
+    --[[ Walking into a dungeon, which is when the overall segment is most
+         likely to be answering last night question. ]]--
+    table.insert(events, "PLAYER_ENTERING_WORLD")
+    table.insert(events, "ZONE_CHANGED_NEW_AREA")
+
     return events
 end
 
@@ -388,8 +561,53 @@ function M:Counts(line)
     return (OB.roster and OB.roster[line.source]) ~= nil
 end
 
+--[[ **Whether this pull is a new fight or the last one continuing.**
+
+     The current segment used to start over on `PLAYER_REGEN_DISABLED`, full
+     stop. That event is "you are now in combat", and combat is not a fight: kill
+     one mob of a pack and the client drops you out of combat for the moment
+     between its death and the next one reaching you, then puts you straight back
+     in. Every kill therefore read as a fresh pull and wiped the count -- which
+     is exactly what a meter is for, gone at the moment you would look at it.
+
+     The fix is not to trust the edge but to measure the gap. A fight has ended
+     when combat has been *over* for a few seconds; anything shorter is the same
+     fight still going. This is what every meter worth using does, and the number
+     is a setting because a caster with long pulls and a rogue chaining packs do
+     not agree on it.
+
+     **Never having been in combat counts as new.** The first pull of a session
+     resets a segment that is already empty, which costs nothing and keeps this
+     from depending on the order events happen to arrive in. ]]--
+function M:FightGap()
+    local seconds = tonumber(self:Config().fightGap) or 5
+    if seconds < 0 then seconds = 0 end
+    return seconds
+end
+
+function M:StartsNewFight(now)
+    --[[ In combat -- or freshly logged in and never out of it -- there is no gap
+         to measure. `leftCombatAt` is cleared when a pull begins precisely so
+         that a second `PLAYER_REGEN_DISABLED` arriving without an intervening
+         `PLAYER_REGEN_ENABLED` cannot be read as a new fight. ]]--
+    if not self.leftCombatAt then
+        return self.everFought ~= true
+    end
+
+    return (now - self.leftCombatAt) >= self:FightGap()
+end
+
 function M:OnEvent()
     local now = GetTime()
+
+    --[[ Walking into a dungeon or a raid, which is when the overall segment is
+         most likely to still be answering last night's question. Asks rather
+         than acts, and only when there is something to reset -- see
+         `CheckInstanceReset`. ]]--
+    if event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
+        self:CheckInstanceReset()
+        return
+    end
 
     if event == "PLAYER_REGEN_DISABLED" then
         --[[ A pull starts the current segment over, if asked. The overall one is
@@ -403,15 +621,25 @@ function M:OnEvent()
              The shape of a segment is one function's business. Anything that
              makes one and is not that function is a second definition waiting
              to fall behind the first. ]]--
-        if self:Config().resetOnPull then
+        if self:Config().resetOnPull and self:StartsNewFight(now) then
             self.data.current = newSegment(now)
         end
+
+        --[[ Cleared last, after the question above has been asked. In combat
+             there is no "when we left", and that absence is what tells the next
+             pull it never ended. ]]--
+        self.leftCombatAt = nil
+        self.everFought = true
 
         OB.SetDirty(self)
         return
     end
 
     if event == "PLAYER_REGEN_ENABLED" then
+        --[[ **When combat ended, not that it ended.** The next pull has to know
+             how long ago this was. ]]--
+        self.leftCombatAt = now
+
         OB.SetDirty(self)
         return
     end
@@ -426,7 +654,98 @@ end
 
 function M:Reset()
     self.data = OB.NewDamageData(GetTime())
+
+    --[[ The fight tracking goes with the numbers. Leaving `leftCombatAt` behind
+         would have the next pull measuring its gap against a fight that no
+         longer exists. ]]--
+    self.leftCombatAt = nil
+    self.everFought = nil
     OB.SetDirty(self)
+end
+
+-- ---------------------------------------------------------------------------
+-- walking into a dungeon with last night's numbers still on screen
+-- ---------------------------------------------------------------------------
+
+--[[ **The Overall segment is the one nobody remembers to reset.**
+
+     `current` starts fresh at every pull and looks after itself. `overall` runs
+     until somebody clears it -- which is the point of it -- so it quietly
+     accumulates across an evening, and the first pull of a raid is measured
+     against three hours of trash from the dungeon before it. The numbers are
+     not wrong, they are just answering a question nobody is asking any more.
+
+     Asked rather than done. An overall segment somebody has been deliberately
+     accumulating is exactly the thing that must not be thrown away on a guess,
+     and walking into an instance is a guess about intent -- a good one, which
+     is why it is worth asking, and still a guess. ]]--
+StaticPopupDialogs["EQOB_RESET_ON_INSTANCE"] = {
+    text = "Reset the overall damage meter for this instance?",
+    button1 = "Reset",
+    button2 = "Keep",
+    OnAccept = function()
+        local m = EquadisClassicOverhaul and EquadisClassicOverhaul.modules
+                and EquadisClassicOverhaul.modules.damage
+        if m then m:Reset() end
+    end,
+    timeout = 0,
+    whileDead = 1,
+    hideOnEscape = 1,
+}
+
+--[[ `GetInstanceInfo` answers `name, instanceType`, and the two types worth
+     asking about are a five-man and a raid. Guarded on the call existing at all
+     because it is not on every 1.12 build -- Questie carries the same guard --
+     and a missing call means the prompt simply never appears rather than the
+     module erroring on a loading screen. ]]--
+function M:InstanceKind()
+    if type(GetInstanceInfo) ~= "function" then return nil end
+
+    local ok, _, kind = pcall(GetInstanceInfo)
+    if not ok or type(kind) ~= "string" then return nil end
+    return kind
+end
+
+--[[ Whether the overall segment has anything in it. **The prompt is only worth
+     raising for a meter that is actually running** -- asking somebody whether
+     to reset a meter reading zero is a dialog that can only waste a click. ]]--
+function M:HasOverall()
+    local data = self.data
+    if not data or not data.overall then return false end
+
+    if OB.SegmentTotal(data.overall, "damage") > 0 then return true end
+    if OB.SegmentTotal(data.overall, "heal") > 0 then return true end
+    return false
+end
+
+--[[ Asked once per instance rather than once per loading screen.
+     `PLAYER_ENTERING_WORLD` fires again on every zone boundary inside a raid,
+     and a dialog that reappears every time you cross one is a dialog people
+     learn to dismiss without reading. ]]--
+function M:CheckInstanceReset()
+    if not OB.ModuleEnabled("damage") then return false end
+    if not self:Config().askResetInInstance then return false end
+
+    local kind = self:InstanceKind()
+
+    if kind ~= "party" and kind ~= "raid" then
+        --[[ Cleared on the way out, so the next instance asks again. Without
+             this, leaving and re-entering the same raid would be silent. ]]--
+        self.askedInstance = nil
+        return false
+    end
+
+    local name = (type(GetRealZoneText) == "function" and GetRealZoneText()) or kind
+    if self.askedInstance == name then return false end
+    self.askedInstance = name
+
+    if not self:HasOverall() then return false end
+
+    if type(StaticPopup_Show) == "function" then
+        StaticPopup_Show("EQOB_RESET_ON_INSTANCE")
+    end
+
+    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -464,8 +783,9 @@ local function ensureMenu(window)
 
     local menu = CreateFrame("Frame", nil, window)
     menu:SetFrameStrata("DIALOG")
-    menu:SetBackdrop(OB.backdrop)
-    menu:SetBackdropColor(0.08, 0.08, 0.09, 0.95)
+    --[==[ A menu that appears over the game for a moment, so it sits lighter
+         than a window somebody reads through. ]==]
+    OB.SkinWindow(menu, 0.95)
     menu:Hide()
     menu.items = {}
 
@@ -530,8 +850,12 @@ local function headerButton(parent, width, caption)
     b:SetWidth(width)
     b:SetHeight(14)
     b:SetBackdrop(OB.backdrop)
-    b:SetBackdropColor(0.2, 0.2, 0.22, 1)
-    b:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+    local face = OB.skin and OB.skin.raised or { 0.2, 0.2, 0.22, 1 }
+    local edge = OB.skin and OB.skin.goldDim or { 0.4, 0.4, 0.4 }
+
+    b:SetBackdropColor(face[1], face[2], face[3], face[4] or 1)
+    b:SetBackdropBorderColor(edge[1], edge[2], edge[3], 1)
     b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
 
     b.text = OB.NewText(b, "OVERLAY", "GameFontNormalSmall")
@@ -747,6 +1071,65 @@ end
      Cursor coordinates come back in the client's own scale, so both deltas are
      divided by it before they mean pixels on this window. Right and *down*
      grows, which is the direction the grip sits in. ]]--
+--[[ **Edit mode unlocks every window, and gives back what it borrowed.**
+
+     Each meter window carries its own `locked`, which is the setting somebody
+     uses to stop nudging a window they have finished placing. Edit mode says
+     *everything moves*, and a window silently refusing to be dragged while
+     outlined like all the others is the same non-answer the map used to give.
+
+     So the lock is overridden while edit mode is on and **restored, per window,
+     when it goes off** -- not cleared. Somebody who locked one window
+     deliberately still has it locked afterwards, which is the difference
+     between borrowing a setting and taking it. ]]--
+function M:SetDragMode(on)
+    if on and not OB.ModuleEnabled("damage") then
+        Say("switch the damage meter on first.")
+        return false
+    end
+
+    local cfg = self:Config()
+    if not cfg or not cfg.windows then return false end
+
+    if on then
+        --[[ Remembered once. Toggling edit mode twice without leaving it must
+             not record the borrowed state as if it were the real one. ]]--
+        if not self.lockedBeforeEdit then
+            self.lockedBeforeEdit = {}
+
+            for i = 1, table.getn(cfg.windows) do
+                self.lockedBeforeEdit[i] = cfg.windows[i].locked and true or false
+                cfg.windows[i].locked = false
+            end
+        end
+
+        if self.frames then
+            for i = 1, table.getn(cfg.windows) do
+                if self.frames[i] then
+                    OB.MarkMovable(self.frames[i], "Damage Meter " .. i)
+                end
+            end
+        end
+
+        return true
+    end
+
+    if self.lockedBeforeEdit then
+        for i = 1, table.getn(cfg.windows) do
+            --[[ A window created *during* edit mode has nothing remembered for
+                 it, and stays as it was made rather than being locked on a
+                 guess. ]]--
+            if self.lockedBeforeEdit[i] ~= nil then
+                cfg.windows[i].locked = self.lockedBeforeEdit[i]
+            end
+        end
+
+        self.lockedBeforeEdit = nil
+    end
+
+    return true
+end
+
 function M:StepResize(frame)
     if not frame.sizing then return end
 
@@ -768,7 +1151,7 @@ function M:StepResize(frame)
     --[[ Width tracks the cursor directly; the row count only changes once the
          cursor has crossed a whole row, so the window is always a whole number
          of rows tall and never ends up half a row short. ]]--
-    local width = OB.Clamp(OB.Round(cfg.width + dx), 100, 500)
+    local width = OB.Clamp(OB.Round(cfg.width + dx), MIN_WINDOW_W, MAX_WINDOW_W)
     local rows = OB.Clamp(cfg.rows + OB.Round(dy / step), 3, 40)
 
     if width == cfg.width and rows == cfg.rows then return end
@@ -934,16 +1317,32 @@ function M:AddWindow()
     local first = cfg.windows[1]
     local made = OB.DeepCopy(first)
 
-    -- offset from the first so the new one is not hidden underneath it
-    made.x = first.x + first.width + 10
-    made.y = first.y
+    --[[ **Offset from the window that is actually there, not always from the
+         first one.**
 
-    --[[ Damage, then healing, then taken: the next question along from whatever
-         window one is answering, so the second window is useful before it is
-         touched. ]]--
-    if first.mode == "damage" then made.mode = "heal"
-    elseif first.mode == "heal" then made.mode = "taken"
-    else made.mode = "damage" end
+         It was `first.x + first.width + 10` every time -- so the second window
+         landed beside the first, and the third landed in *exactly* the same
+         place as the second, and the fourth on top of both. Clicking New twice
+         produced one visible window with two more hidden underneath it, which
+         is what was reported.
+
+         Cascaded from the last window instead, so each new one steps along from
+         wherever the previous one ended up rather than from a fixed point. ]]--
+    local previous = cfg.windows[table.getn(cfg.windows)] or first
+    made.x = previous.x + (previous.width or first.width or 200) + 10
+    made.y = previous.y
+
+    --[[ **A new window shows what the one you copied shows.**
+
+         It used to walk damage -> healing -> taken on the reasoning that a
+         second window exists to answer the next question along. In practice
+         that means clicking New hands you a healing meter you did not ask for,
+         and if window one was on Overall you get overall *healing* -- two
+         changes at once, neither of them requested.
+
+         A copy is the honest reading of a button called New: it gives you
+         another one of what you have, and the mode dropdown is right there on
+         the header for the moment you want something else. ]]--
 
     table.insert(cfg.windows, made)
 
@@ -1025,7 +1424,7 @@ function M:ShowRowTooltip(row)
     local segment = self.data[cfg.segment] or self.data.current
     local spells = OB.DamageSpells(segment, cfg.mode, row.entryName)
 
-    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    OB.OwnTooltip(row, "ANCHOR_RIGHT")
     GameTooltip:ClearLines()
 
     GameTooltip:AddDoubleLine(row.entryName,
@@ -1080,6 +1479,16 @@ function M:StyleWindow(frame)
 
     self:EnsureRows(frame, cfg.rows)
 
+    --[==[ **Corrected on the way out, not only on the way in.**
+
+         A width saved before the floor existed is still in the profile, and a
+         clamp that only guards new input would draw it broken forever while
+         quietly reporting a legal number on the settings page. Written back
+         rather than merely used, so the slider and the window agree about what
+         this window is. ]==]
+    if (tonumber(cfg.width) or 0) < MIN_WINDOW_W then cfg.width = MIN_WINDOW_W end
+    if (tonumber(cfg.width) or 0) > MAX_WINDOW_W then cfg.width = MAX_WINDOW_W end
+
     frame:SetWidth(cfg.width)
     frame:SetHeight(HEADER_H + (step * cfg.rows) + (pad * 2))
     frame:SetScale(self:Scale())
@@ -1100,7 +1509,7 @@ function M:StyleWindow(frame)
          having an opinion.
 
          A profile carried to a smaller monitor can leave a window off the edge.
-         That is recoverable -- `/eqob windows` says where everything is, and the
+         That is recoverable -- `/eq windows` says where everything is, and the
          sliders reach it -- and it is a far smaller cost than rearranging a
          layout somebody built, every single load. ]]--
 
@@ -1240,28 +1649,95 @@ end
 --[[ The right-hand label: total, rate and share, in whichever combination is
      switched on. Assembled rather than fixed, because which of the three matter
      depends on what you are looking for and all three may be on at once. ]]--
+--[[ **Reused, because this ran per row per redraw.**
+
+     Measured at 4801 calls in forty-eight seconds -- eight rows a window, two
+     windows, several times a second, whether or not a number had changed. A
+     fresh table each time is a table a row per draw thrown away immediately. ]]--
+local textParts = {}
+
+--[[ **The formatted right-hand column, remembered against what it was made
+     from.**
+
+     Every part of this allocates: two `ShortNumber` strings, a concatenation
+     for the percent, and the `concat` at the end. None of it changes unless one
+     of the three numbers or one of the three settings does, and out of combat
+     none of them do.
+
+     The key is the inputs themselves rather than a revision, because that is
+     what the answer actually depends on -- a row that is reused for a different
+     player with an identical total wants the identical string, and gets it. ]]--
 function M:RowText(cfg, row)
-    local parts = {}
+    local showTotal = cfg.showTotal and true or false
+    local showPerSecond = cfg.showPerSecond and true or false
+    local showPercent = cfg.showPercent and true or false
 
-    if cfg.showTotal then table.insert(parts, OB.ShortNumber(row.total)) end
-    if cfg.showPerSecond then
-        table.insert(parts, OB.ShortNumber(row.perSecond))
-    end
-    if cfg.showPercent then
-        table.insert(parts, OB.Round(row.share * 100) .. "%")
+    if row.textValue
+            and row.textTotal == row.total
+            and row.textPerSecond == row.perSecond
+            and row.textShare == row.share
+            and row.textShowTotal == showTotal
+            and row.textShowPerSecond == showPerSecond
+            and row.textShowPercent == showPercent then
+        return row.textValue
     end
 
-    return table.concat(parts, OB.COLUMN_GAP)
+    local count = 0
+
+    if showTotal then
+        count = count + 1
+        textParts[count] = OB.ShortNumber(row.total)
+    end
+
+    if showPerSecond then
+        count = count + 1
+        textParts[count] = OB.ShortNumber(row.perSecond)
+    end
+
+    if showPercent then
+        count = count + 1
+        textParts[count] = OB.Round(row.share * 100) .. "%"
+    end
+
+    --[[ Trimmed, or turning a column off would leave its last value on the end
+         of every row for as long as the table kept it. ]]--
+    for i = table.getn(textParts), count + 1, -1 do
+        textParts[i] = nil
+    end
+
+    local text = table.concat(textParts, OB.COLUMN_GAP)
+
+    row.textValue = text
+    row.textTotal = row.total
+    row.textPerSecond = row.perSecond
+    row.textShare = row.share
+    row.textShowTotal = showTotal
+    row.textShowPerSecond = showPerSecond
+    row.textShowPercent = showPercent
+
+    return text
 end
 
---[[ The left-hand label: a rank and a name, or just a name.
+--[[ Remembered the same way and for the same reason as the text column. With
+     the rank on, this concatenates a number and a name for every row of every
+     redraw; the answer changes only when the row's position or occupant does.
 
-     The rank is worth a setting because it answers "am I third" without
-     counting rows, and worth being optional because on a five row window
-     counting is free. ]]--
+     With the rank off it returns the name unchanged and allocates nothing, so
+     that path is left exactly as it was. ]]--
 function M:RowName(cfg, index, row)
-    if cfg.showRank then return index .. ". " .. row.name end
-    return row.name
+    if not cfg.showRank then return row.name end
+
+    if row.nameValue
+            and row.nameIndex == index
+            and row.nameSource == row.name then
+        return row.nameValue
+    end
+
+    row.nameValue = index .. ". " .. row.name
+    row.nameIndex = index
+    row.nameSource = row.name
+
+    return row.nameValue
 end
 
 --[[ **Bar colour, unless class knows better.**
@@ -1270,16 +1746,58 @@ end
      which is the setting the panel now carries. A row whose class cannot be
      resolved -- a pet, a boss, anybody outside the group -- is not an error and
      should not look like one. ]]--
+--[[ **One table per class, not one per row per draw.**
+
+     This returned a fresh `{ r, g, b, 1 }` every time it was asked, and it is
+     asked once per row of every window on every redraw. Measured in a fight:
+     978 kB across 904 draws, which is nine thousand tables for nine colours
+     that have not changed since the client shipped.
+
+     Safe to share because `OB.SetBarColor` only reads it -- and because the
+     other branch has always handed back `cfg.barColor` itself, so a shared
+     table is already what a caller gets half the time. ]]--
+local classColors = {}
+
 function M:RowColor(cfg, entry)
     if cfg.classColor then
         local class = OB.GroupClass(entry.name)
+
         if class then
-            local r, g, b = OB.ClassColor(class)
-            return { r, g, b, 1 }
+            local color = classColors[class]
+
+            if not color then
+                local r, g, b = OB.ClassColor(class)
+                color = { r, g, b, 1 }
+                classColors[class] = color
+            end
+
+            return color
         end
     end
 
     return cfg.barColor
+end
+
+--[==[ The wheel, claimed on the window itself so it works wherever the cursor
+     is inside it rather than only over a row. A meter is scrolled at speed while
+     something else has your attention. ]==]
+function M:InstallScroll(frame)
+    if frame.ecoScrolls then return false end
+    if not frame.EnableMouseWheel then return false end
+
+    frame.ecoScrolls = true
+    frame.scroll = 0
+
+    frame:EnableMouseWheel(true)
+
+    frame:SetScript("OnMouseWheel", function()
+        local m = EquadisClassicOverhaul.modules.damage
+
+        this.scroll = (this.scroll or 0) + ((arg1 and arg1 > 0) and -1 or 1)
+        m:DrawWindow(this)
+    end)
+
+    return true
 end
 
 function M:DrawWindow(frame)
@@ -1287,6 +1805,7 @@ function M:DrawWindow(frame)
     if not cfg then return end
 
     self:EnsureRows(frame, cfg.rows)
+    self:InstallScroll(frame)
 
     local segment = self.data[cfg.segment] or self.data.current
     local rows = OB.DamageRows(segment, cfg.mode)
@@ -1299,9 +1818,30 @@ function M:DrawWindow(frame)
     local top = rows[1] and rows[1].total or 0
     if top <= 0 then top = 1 end
 
+    --[==[ **The list scrolls, because a raid is longer than a window.**
+
+         The meter shows the top few and there is no window size that is right
+         for both a five-man and a forty-man. Scrolled rather than resized: the
+         window is somewhere you put once, and what changes is how far down the
+         list you are looking.
+
+         Clamped on every draw and not only when the wheel turns. The list is
+         re-sorted constantly in combat -- people join it, and somebody who was
+         twentieth is fifth a moment later -- so an offset that was valid when it
+         was set can be past the end by the next redraw, which would blank the
+         window in the middle of a fight. ]==]
+    local offset = frame.scroll or 0
+    local most = table.getn(rows) - cfg.rows
+
+    if most < 0 then most = 0 end
+    if offset > most then offset = most end
+    if offset < 0 then offset = 0 end
+
+    frame.scroll = offset
+
     for i = 1, table.getn(frame.rows) do
         local row = frame.rows[i]
-        local entry = rows[i]
+        local entry = rows[i + offset]
 
         if not entry or i > cfg.rows then
             row.entryName = nil
@@ -1320,7 +1860,11 @@ function M:DrawWindow(frame)
             row.entryName = entry.name
             row.windowIndex = frame.index
 
-            OB.SetBarText(row, row.left, self:RowName(cfg, i, entry), 0)
+            --[[ Held rather than drawn here. How much room the name has
+                 depends on the widest number column in the window, which
+                 no single row knows; AlignColumns fits and places it once
+                 every row has been measured. ]]--
+            row.leftFull = self:RowName(cfg, i, entry)
             OB.SetBarText(row, row.center, "", 50)
 
             --[[ Placed below, once the widest row is known: every row's numbers
@@ -1374,25 +1918,40 @@ end
      window's right edge. Two passes rather than one, because the answer depends
      on every row and no row can know it alone. ]]--
 function M:AlignColumns(frame)
-    local widest, leftUsed = 0, 0
+    local widest = 0
 
+    --[[ The numbers first, because they are what the name has to fit around.
+         Measured across every visible row: the column is only a column if all
+         of them begin at the same x. ]]--
     for i = 1, table.getn(frame.rows) do
         local row = frame.rows[i]
 
         if row:IsShown() then
             local w = row.right:GetStringWidth() or 0
             if w > widest then widest = w end
-
-            local l = row.left:GetStringWidth() or 0
-            if l > leftUsed then leftUsed = l end
         end
     end
 
+    local first = frame.rows[1]
+    if not first then return end
+
+    --[[ **The names are cut to what is left, and the numbers keep their edge.**
+
+         This used to run the other way: the names were measured too, and a row
+         whose name would have reached the number column pushed that column
+         right instead -- past the end of the bar, taking the trailing "%" off
+         the window with it. The numbers are the reason the window is open, so
+         they are the half that is guaranteed the space. ]]--
+    local room = OB.NameRoom(first, widest)
+    local at = OB.ColumnStart(first, widest, 0)
+
     for i = 1, table.getn(frame.rows) do
         local row = frame.rows[i]
+
         if row:IsShown() then
-            OB.PlaceTextLeftAt(row, row.right,
-                    OB.ColumnStart(row, widest, leftUsed))
+            OB.FitTextTo(row.left, row.leftFull, room)
+            OB.PlaceText(row, row.left, 0)
+            OB.PlaceTextLeftAt(row, row.right, at)
         end
     end
 end

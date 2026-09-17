@@ -362,7 +362,7 @@ local shaguHookFrame = nil
 function AtlasCFM.Integrations.ApplyShaguTweaksIntegration()
     if AtlasCFM.Integrations.HasShaguTweaks() and AtlasCFMOptions.LootEquipCompare == true then
         if not shaguHookFrame then
-            shaguHookFrame = CreateFrame("Frame")
+            shaguHookFrame = CreateFrame("Frame", "AtlasCFMShaguCompareWatch")
             shaguHookFrame:SetScript("OnUpdate", function()
                 if AtlasCFMLootTooltip and AtlasCFMLootTooltip:IsShown() then
                     ShowShaguCompare(AtlasCFMLootTooltip)

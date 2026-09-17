@@ -98,16 +98,6 @@ local BINDING_API = {
     end,
 }
 
---[[ Whether a binding can actually be run on this client, which is what decides
-     if it may be bound to a command at all. Offering one that cannot is worse
-     than not offering it: the command exists, does nothing, and looks broken. ]]--
-function OB.CanRunBinding(command)
-    if not command or command == "" then return false end
-    if type(RunBinding) == "function" then return true end
-
-    return BINDING_API[command] ~= nil
-end
-
 --[[ One binding, run.
 
      `RunBinding` first where it exists, because that is the client doing exactly
@@ -255,6 +245,56 @@ end
 
 --[[ Framerate and latency together, because they are the two numbers somebody
      wants at the same moment and the client shows one of them. ]]--
+--[==[ **The battleground window, which the client will not open for you.**
+
+     The group finder has a binding -- `TOGGLEGROUPFINDER`, which is why `/lfg`
+     is a line in the shipped list and not a function. There is no equivalent
+     for battlegrounds: all two hundred and thirty-five of this client's
+     bindings were read, and the only two that mention them are the battlefield
+     *minimap* and the *scoreboard*. Neither queues you for anything.
+
+     `BattlefieldFrame` is the window, and `ShowUIPanel` is how the client opens
+     it -- but the client only does that from the battlemaster's gossip, and the
+     list of battlegrounds inside it is sent by the server at the same moment.
+     Opened cold it is a real window with nothing in it, which reads as broken.
+
+     So the emptiness is checked for and said out loud, rather than shown. If
+     the server has sent nothing, the honest answer is that you have to go and
+     talk to a battlemaster, not a blank frame you are left to interpret. ]==]
+function OB.ToggleBattlegrounds()
+    local frame = getglobal("BattlefieldFrame")
+
+    if not frame then
+        Say("this client has no battleground window.")
+        return false
+    end
+
+    if frame:IsVisible() then
+        if type(HideUIPanel) == "function" then HideUIPanel(frame) else frame:Hide() end
+        return true
+    end
+
+    --[[ How many battlegrounds the server has told us about. Zero means the
+         conversation that fills it has not happened. ]]--
+    local known = 0
+    if type(GetNumBattlefields) == "function" then
+        known = GetNumBattlefields() or 0
+    elseif type(GetBattlefieldInfo) == "function" then
+        known = GetBattlefieldInfo() and 1 or 0
+    end
+
+    if known < 1 then
+        Say("the server has not sent a battleground list yet -- talk to a "
+                .. "battlemaster once and this will open it after that.")
+        return false
+    end
+
+    if type(ShowUIPanel) == "function" then ShowUIPanel(frame) else frame:Show() end
+
+    return true
+end
+
+
 function OB.PrintFramerate()
     local _, _, latency = GetNetStats()
 
@@ -275,6 +315,8 @@ OB.commandBuiltins = {
     { id = "fps", label = "Framerate And Latency", run = OB.PrintFramerate },
     { id = "hud", label = "Hide The Interface", run = OB.ToggleHud },
     { id = "combatlog", label = "Combat Logging", run = OB.ToggleCombatLog },
+    { id = "battlegrounds", label = "The Battleground Finder",
+      run = OB.ToggleBattlegrounds },
 }
 
 
@@ -293,7 +335,7 @@ function OB.CommandBuiltin(action)
     return nil
 end
 
---[[ What a command does, in the words the panel and `/eqob cmd` both use. ]]--
+--[[ What a command does, in the words the panel and `/eq cmd` both use. ]]--
 function OB.CommandLabel(action)
     local builtin = OB.CommandBuiltin(action)
     if builtin then return builtin.label end
@@ -335,6 +377,16 @@ local SHIPPED = {
     { "sit", "SITORSTAND" },
     { "sheath", "TOGGLESHEATH" },
     { "autorun", "TOGGLEAUTORUN" },
+
+    --[[ `TOGGLEGROUPFINDER` is this client's own binding for the group finder,
+         so `/lfg` is the binding rather than a function that reaches for a
+         frame by name. The finder is a protected addon here -- Turtle_GroupUI
+         ships as 257 bytes of encrypted stub -- so its frames cannot be named
+         from outside, and the binding is the only supported way in. ]]--
+    { "lfg", "TOGGLEGROUPFINDER" },
+
+    --[[ No binding exists for this one. See `OB.ToggleBattlegrounds`. ]]--
+    { "lfbg", "@battlegrounds" },
 }
 
 --[[ **`SlashCmdList` is flat and first come wins.**

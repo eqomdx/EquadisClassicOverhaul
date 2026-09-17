@@ -49,6 +49,27 @@ local floor = math.floor
      override, and then wrong in exactly one place nobody would look. ]]--
 local LOOK_KEYS = { "texture", "font", "fontSize", "fontOutline", "border" }
 
+--[[ **One table per module, refilled rather than rebuilt.**
+
+     This was the addon's largest single allocator, and it did not look like one:
+     five keys copied into a fresh table, which is nothing. What made it the
+     largest was where it is called from. `OB.ApplyFont` asks for a look *and*
+     asks `OB.FontPath`, which asks for the look again -- two tables per call --
+     and the tooltip styles every line on both sides on every tick it is on
+     screen. A twenty-line tooltip is 160 tables a tick. Measured: 3879 kB
+     across 159 calls, 24 kB each.
+
+     Refilling one table per module costs nothing and needs no invalidation,
+     which is the point: a cache with a lifetime is a cache that can be stale,
+     and this has to be right the instant a setting changes.
+
+     **The returned table is shared and is overwritten by the next call for the
+     same module.** Every caller reads its fields immediately, which is what
+     makes that safe; one that wanted to keep a look would need a copy. That is
+     already the contract for the two paths below, which hand back the profile
+     itself. ]]--
+local lookCache = {}
+
 function OB.Look(moduleId)
     local profile = OB.profile
     if not moduleId then return profile end
@@ -56,16 +77,30 @@ function OB.Look(moduleId)
     local cfg = profile.modules and profile.modules[moduleId]
     if not cfg then return profile end
 
+    local look = lookCache[moduleId]
+
+    if not look then
+        look = {}
+        lookCache[moduleId] = look
+    end
+
     --[[ Falls back key by key rather than wholesale. A subsystem saved before a
          look key existed has no value for it, and inheriting the shared one is
          right -- inheriting nothing would draw an invisible bar. ]]--
-    local look = {}
     for i = 1, table.getn(LOOK_KEYS) do
         local key = LOOK_KEYS[i]
         if cfg[key] ~= nil then look[key] = cfg[key] else look[key] = profile[key] end
     end
 
     return look
+end
+
+--[[ Dropped when the profile itself is replaced. The tables would refill
+     correctly anyway -- they are rewritten on every call -- but a module that
+     existed in the old profile and not the new one would keep a table nothing
+     will ever ask for again. ]]--
+function OB.ForgetLooks()
+    lookCache = {}
 end
 
 function OB.FontPath(moduleId)
@@ -119,20 +154,54 @@ OB.BAR_TEXTS = { "left", "right", "center", "extra" }
 --[[ Apply the configured family, size and outline. A missing or unreadable .ttf
      makes SetFont fail silently and leaves the string invisible, so fall back to
      the client font when that happens. ]]--
-function OB.ApplyFont(fontstring, size, moduleId)
+--[[ `force` is passed by callers that draw onto something other than a backdrop
+     of their own -- nameplates, which draw onto the world. Unoutlined text over
+     terrain does not read as plainer, it disappears, and it disappears
+     differently depending on which way the camera is facing. The caller decides
+     whether that applies to it; this only honours the request. ]]--
+function OB.ApplyFont(fontstring, size, moduleId, force)
     if not fontstring then return end
 
     local look = OB.Look(moduleId)
 
-    local outline
-    if look.fontOutline then outline = "OUTLINE" end
+    --[[ `force` is for text that must carry an outline whatever the profile
+         says -- a label over artwork -- so it lifts a "None" to thin and leaves
+         a thick one alone. ]]--
+    local outline = OB.FontFlags(look.fontOutline)
+    if force and not outline then outline = "OUTLINE" end
 
     size = size or look.fontSize
-    fontstring:SetFont(OB.FontPath(moduleId), size, outline)
+
+    local path = OB.FontPath(moduleId)
+
+    --[[ **Nothing to do if it already says that.**
+
+         `SetFont` is not free even when the font does not change -- it is a
+         client call that re-resolves the file and re-measures the string -- and
+         the tooltip asks for every line on both sides on every tick it is on
+         screen. Nothing about the answer changes between two ticks.
+
+         Remembered on the FontString rather than in a table beside it, because
+         these are the client's own objects and outlive anything this addon
+         keeps: a line created for one tooltip is reused for the next. ]]--
+    if fontstring.eqEcoFontPath == path
+            and fontstring.eqEcoFontSize == size
+            and fontstring.eqEcoFontOutline == outline then
+        return
+    end
+
+    fontstring:SetFont(path, size, outline)
 
     if not fontstring:GetFont() then
         fontstring:SetFont(STANDARD_TEXT_FONT, size, outline)
+        path = STANDARD_TEXT_FONT
     end
+
+    --[[ Recorded after the fallback, so what is remembered is what the
+         FontString actually ended up with rather than what was asked for. ]]--
+    fontstring.eqEcoFontPath = path
+    fontstring.eqEcoFontSize = size
+    fontstring.eqEcoFontOutline = outline
 end
 
 -- ---------------------------------------------------------------------------
@@ -183,10 +252,20 @@ function OB.IconButton(parent, icon)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(16)
     b:SetHeight(14)
+    --[==[ The same face and edge the panel's own buttons wear. This was a
+         grey box with a grey line round it, which is what the whole interface
+         looked like before there was a palette to disagree with. ]==]
     b:SetBackdrop(OB.backdrop)
-    b:SetBackdropColor(0.2, 0.2, 0.22, 1)
-    b:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
-    b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+
+    local face = OB.skin and OB.skin.raised or { 0.2, 0.2, 0.22, 1 }
+    local edge = OB.skin and OB.skin.goldDim or { 0.4, 0.4, 0.4 }
+
+    b:SetBackdropColor(face[1], face[2], face[3], face[4] or 1)
+    b:SetBackdropBorderColor(edge[1], edge[2], edge[3], 1)
+
+    --[[ The quest-log gradient has the quest log's proportions baked in and was
+         being stretched across a sixteen-pixel button. ]]--
+    b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
 
     b.icon = b:CreateTexture(nil, "OVERLAY")
     b.icon:SetPoint("TOPLEFT", b, "TOPLEFT", 2, -1)
@@ -367,6 +446,97 @@ function OB.ColumnStart(bar, widest, leftUsed)
     if x < TEXT_PAD then x = TEXT_PAD end
 
     return x
+end
+
+--[[ **How much room the left label has**, once the numbers on the right have
+     taken theirs.
+
+     The counterpart to ColumnStart, and the half that was missing. ColumnStart
+     alone answers "where do the numbers begin", and when the answer collided
+     with a long name it resolved the collision by moving the numbers *right* --
+     off the end of the bar, so the last column ran past the window edge and the
+     trailing "%" was cut off. That is the reported "it's cut short".
+
+     A name is recognisable from its first several letters and a total is not
+     recognisable from its first two digits, so when the two cannot both fit it
+     is the name that gives way. Every meter that has solved this has solved it
+     this way round. ]]--
+function OB.NameRoom(bar, widest)
+    local width = bar:GetWidth() or 0
+    local room = width - (TEXT_PAD * 3) - (widest or 0)
+
+    if room < 0 then room = 0 end
+    return room
+end
+
+--[[ **A label cut to fit, with the cut marked.**
+
+     1.12 font strings do not truncate: given a width they wrap onto a second
+     line, which inside a fifteen-pixel bar means a name sliced through the
+     middle horizontally. So the trimming is done to the string itself.
+
+     **Seeded proportionally rather than walked from the end.** Measuring is a
+     call into the font engine and this runs per row per redraw -- a dozen rows
+     several times a second. Character width is near enough uniform that
+     `n * (room / width)` lands within a character or two, so the loop that
+     follows almost never runs more than twice; walking one character at a time
+     from full length cost a dozen measurements a row for the same answer.
+
+     Remembered against the string and the width it was fitted to, because
+     neither changes between most redraws and re-deriving an unchanged answer is
+     the whole cost. ]]--
+function OB.FitTextTo(text, full, maxWidth)
+    full = full or ""
+
+    --[[ The font size is part of the key as much as the string is: the same
+         name in the same room fits at ten points and does not at fourteen, and
+         a cache that watched only the text would keep the ten-point trim after
+         a restyle raised the size. ]]--
+    local _, size = text:GetFont()
+
+    if text.ecoFitFull == full and text.ecoFitMax == maxWidth
+            and text.ecoFitSize == size then
+        return
+    end
+
+    text.ecoFitFull = full
+    text.ecoFitMax = maxWidth
+    text.ecoFitSize = size
+
+    text:SetText(full)
+
+    if not maxWidth or maxWidth <= 0 then return end
+
+    local width = text:GetStringWidth() or 0
+    if width <= maxWidth then return end
+
+    local n = string.len(full)
+    local keep = math.floor(n * (maxWidth / width))
+
+    if keep >= n then keep = n - 1 end
+    if keep < 1 then keep = 1 end
+
+    text:SetText(string.sub(full, 1, keep) .. "..")
+
+    --[[ Down if the guess was long, up if it was short. Both directions,
+         because a proportional guess is as likely to under-fill the space as to
+         overflow it and a name cut shorter than it needed to be is the same
+         defect in the other direction. ]]--
+    while keep > 1 and (text:GetStringWidth() or 0) > maxWidth do
+        keep = keep - 1
+        text:SetText(string.sub(full, 1, keep) .. "..")
+    end
+
+    while keep < n - 1 do
+        text:SetText(string.sub(full, 1, keep + 1) .. "..")
+
+        if (text:GetStringWidth() or 0) > maxWidth then
+            text:SetText(string.sub(full, 1, keep) .. "..")
+            return
+        end
+
+        keep = keep + 1
+    end
 end
 
 --[[ Set a label and place it, in that order.
@@ -588,12 +758,45 @@ function OB.StyleBar(bar, slot, width, moduleId)
     bar.bg:SetTexture(bg[1], bg[2], bg[3], bg[4] or 0.5)
 
     local pad = OB.BorderPad(moduleId)
-    local edge = OB.borderEdges[OB.Look(moduleId).border]
+
+    --[==[ Sized against the border frame rather than the bar: it is the frame
+         the backdrop is drawn on, and it is `pad` larger on every side. Asking
+         about the bar would clamp a fraction too hard and leave a border
+         thinner than it had room for. ]==]
+    local edge = OB.BorderEdge(OB.Look(moduleId).border,
+            (width or slot.w) + (pad * 2), slot.h + (pad * 2))
 
     if pad > 0 and edge then
+        --[==[ **Hung by the ink, not by the reserved room -- two different
+             questions that `OB.BorderPad` was answering with one number.**
+
+             Layout asks "how much room does a border need beside this bar", and
+             a constant per style is right for that: bars of different heights
+             have to space the same or the cluster is ragged. That is what
+             `OB.borderPads` is and it stays.
+
+             Drawing asks "how far out do I hang the frame so the art lands on
+             the bar", and the answer is the edge's own `outset` at the size it
+             is actually drawn -- which `OB.BorderEdge` has just scaled for this
+             bar. Using the layout number for it is a guess that happens to be
+             right for one style out of three.
+
+             On a twelve pixel bar: `Classic` reserves two and its ink reaches
+             one, `Blizzard` reserves five and its narrowed ink reaches under
+             four. Both hung the frame further out than the art, leaving a band
+             between the bar and the line with nothing drawn in it.
+
+             Clamped to the reserved room, because hanging further out than
+             layout allowed for would put the ink in the next bar's gap. ]==]
+        local hang = math.floor(tonumber(edge.outset)
+                or ((tonumber(edge.edgeSize) or 8) / 2))
+
+        if hang < 1 then hang = 1 end
+        if hang > pad then hang = pad end
+
         bar.border:ClearAllPoints()
-        bar.border:SetPoint("TOPLEFT", bar, "TOPLEFT", -pad, pad)
-        bar.border:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", pad, -pad)
+        bar.border:SetPoint("TOPLEFT", bar, "TOPLEFT", -hang, hang)
+        bar.border:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", hang, -hang)
         bar.border:SetBackdrop(edge)
         bar.border:SetBackdropBorderColor(1, 1, 1, 1)
         bar.border:Show()
@@ -630,12 +833,6 @@ function OB.SetBarColor(bar, color, alpha)
     local a = color[4] or 1
     if alpha then a = a * alpha end
     bar.fill:SetVertexColor(color[1], color[2], color[3], a)
-end
-
-function OB.ClearBarText(bar)
-    bar.left:SetText("")
-    bar.right:SetText("")
-    bar.center:SetText("")
 end
 
 -- ---------------------------------------------------------------------------

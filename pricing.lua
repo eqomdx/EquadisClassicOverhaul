@@ -190,6 +190,70 @@ function Market:GetHistory(itemId, suffixId)
     return nil
 end
 
+--[[ **What an item has been worth, rather than what it is worth today.**
+
+     `GetHistory` has been here since this file was written and nothing has ever
+     read it. It returns the provider's own series -- aux keeps up to eleven
+     dated points, one per day it has seen the item -- and a series is the only
+     thing that can answer "is this expensive at the moment or is it always this
+     expensive", which is the question a single market value cannot.
+
+     Averaged plainly rather than weighted. `Market:GetPrices().auction` is
+     already aux's weighted median and is the better number for "what is this
+     worth"; the point of this one is different -- it is the flat mean against a
+     high and a low, so the three read as a range with a middle. Two differently
+     weighted averages sitting next to each other would just look like a
+     disagreement.
+
+     Points with no value are skipped rather than counted as zero: a day the
+     provider recorded nothing is a gap in the series, and treating it as a free
+     item would drag every average down and make every low a lie. ]]--
+function Market:GetStats(itemId, suffixId)
+    local history = self:GetHistory(itemId, suffixId)
+    if type(history) ~= "table" then return nil end
+
+    local total, count, high, low = 0, 0, nil, nil
+    local newest, oldest = nil, nil
+
+    for _, point in pairs(history) do
+        local value = point and tonumber(point.value)
+
+        if value and value > 0 then
+            total = total + value
+            count = count + 1
+
+            if not high or value > high then high = value end
+            if not low or value < low then low = value end
+
+            local when = tonumber(point.time)
+            if when then
+                if not newest or when > newest then newest = when end
+                if not oldest or when < oldest then oldest = when end
+            end
+        end
+    end
+
+    if count == 0 then return nil end
+
+    return {
+        average = total / count,
+        high = high,
+        low = low,
+
+        --[[ How many days the answer rests on. A high and a low taken from two
+             points are two prices, not a range, and anything showing this ought
+             to be able to say so. ]]--
+        points = count,
+
+        newest = newest,
+        oldest = oldest,
+    }
+end
+
+function OB.GetItemStats(itemId, suffixId)
+    return Market:GetStats(itemId, suffixId)
+end
+
 function Market:GetPrices(itemId, suffixId)
     itemId = normalizedId(itemId)
     suffixId = tonumber(suffixId) or 0

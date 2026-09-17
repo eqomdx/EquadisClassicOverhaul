@@ -258,7 +258,7 @@ end
      automatically for a rogue would move a hunter's bars. Restack Occupied Bars
      does it on demand -- see constraint 15. ]]--
 OB.defaults = {
-    schema = 21,
+    schema = 43,
 
     -- visibility
     show = true,
@@ -267,9 +267,47 @@ OB.defaults = {
     hideDead = true,
 
     -- movement
-    locked = false,
+    --[==[ **Locked, because an unlocked bar takes the mouse and a bar with the
+         mouse eats a click meant for whatever is under it.**
+
+         `OB.SetMouseEnabled(not locked)` enables the mouse on every draggable
+         HUD bar, and this shipped `false` -- so out of the box the swing timers,
+         the combo points and the resource bar were all taking clicks, at MEDIUM
+         strata, which is where the client's action buttons are. Anywhere one
+         overlapped a button the click went to the bar and the spell did not
+         cast. Reported as "sometimes I click a spell but it doesn't register",
+         and the "sometimes" is the overlap.
+
+         The action bars module reached the opposite conclusion about its own
+         anchors and wrote down why: *a permanently draggable action bar is one
+         you move by accident while clicking a spell on it*. Same reasoning, and
+         the HUD had the other default.
+
+         **This is edit mode's flag, not a preference of its own.**
+         `OB.SetEditMode` writes `locked = not on`, so leaving edit mode locks
+         and entering it unlocks. Shipping `false` meant shipping the
+         edit-mode-is-on state without edit mode being on. ]==]
+    locked = true,
+
     join = true,
     allowOverlap = false,
+
+    --[[ **The alignment grid**, shown while edit mode is on and only then: a
+         grid over the whole screen while you are playing is not an aid, and the
+         one time it is one is while something is being moved.
+
+         **On, because edit mode is the only thing that shows it.** It shipped
+         off, which meant unlocking everything to move a frame gave you no way
+         to line it up against anything -- and the switch that would have was on
+         a different page, named for a thing that was not visible. Somebody who
+         does not want it can say so; somebody who has not said anything is in
+         edit mode precisely because they are lining something up.
+
+         Thirty-two is a quarter of the usual bar height and a whole number of
+         action buttons plus spacing, so most things land on it without being
+         nudged. ]]--
+    grid = true,
+    gridSize = 32,
 
     --[[ Pixels left between stacked bars, on top of whatever the border needs.
          Read by RestackBars only: it changes where Restack *puts* things rather
@@ -285,7 +323,15 @@ OB.defaults = {
     font = OB.fontIndex["Roboto"] or 1,
     fontName = "Roboto",
     fontSize = 12,
-    fontOutline = true,
+    fontOutline = 2,   -- Thin; see OB.fontOutlines
+
+    --[==[ **Dragging the camera from on top of a frame.**
+
+         On, because the alternative is the camera not working wherever a
+         nameplate happens to be, which on a pull is most of the screen. A press
+         that does not move is still a click and still opens what it opened --
+         see `OB.ArmCameraDrag`. ]==]
+    cameraDrag = true,
 
     -- feedback
     audible = false,
@@ -899,6 +945,638 @@ OB.profileMigrations = {
             p.modulesEnabled.tooltip = nil
         end
     end },
+
+    --[[ **A colour setting says so in its key.** Five of Tooltip's did not --
+         `background`, `friendlyTarget`, `neutralTarget`, `hostileTarget`,
+         `playerTarget` -- so a reader met `cfg.hostileTarget` and had to go and
+         look up whether that was a colour, a unit or a switch. Every other
+         colour in the addon ends in `Color`, and the panel's own naming check
+         had been reporting these five for as long as it has existed.
+
+         Renamed rather than exempted, and carried forward here so somebody who
+         picked their own tooltip colours keeps them.
+
+         **Assigned unconditionally, not only when the new key is empty.** It
+         never is: `LoadConfig` copies the defaults, merges the saved profile on
+         top and *then* runs these steps, so by the time this reads `t[to]` it is
+         holding the shipped default. Guarding on it being nil therefore threw
+         away every colour this step exists to keep -- silently, and only for the
+         people who had bothered to choose one. The presence of the *old* key is
+         what says a value needs moving.
+
+         Straight assignment rather than a merge: these are four-number lists,
+         and merging a saved `{0.1, 0.2, 0.3}` into a default `{0, 0, 0, 0.85}`
+         would keep the default's alpha. ]]--
+    { 22, function(p)
+        local t = p.modules and p.modules.tooltip
+        if not t then return end
+
+        local renamed = {
+            background = "backgroundColor",
+            friendlyTarget = "friendlyTargetColor",
+            neutralTarget = "neutralTargetColor",
+            hostileTarget = "hostileTargetColor",
+            playerTarget = "playerTargetColor",
+        }
+
+        for from, to in pairs(renamed) do
+            if t[from] ~= nil then
+                t[to] = t[from]
+                t[from] = nil
+            end
+        end
+    end },
+
+    --[[ **A shape became a number of rows, and a number of buttons.**
+
+         The action bars offered six fixed arrangements -- 1x12, 2x6, 3x4 and so
+         on -- picked from a list. The list is the wrong shape for the question:
+         it cannot say "eight buttons in two rows", because eight buttons was not
+         one of the six, and it cannot say "only show six of them" at all.
+
+         The old index carried the row count already, so it converts exactly:
+         entry three was three rows and still is. Anybody who had picked one
+         keeps the bar they picked. ]]--
+    { 23, function(p)
+        local a = p.modules and p.modules.actionbars
+        if not a then return end
+
+        local rowsFor = { 1, 2, 3, 4, 6, 12 }
+
+        for _, key in ipairs({ "main", "bottomLeft", "bottomRight",
+                               "right", "left" }) do
+            local old = a[key .. "Layout"]
+
+            if old ~= nil then
+                a[key .. "Rows"] = rowsFor[tonumber(old) or 1] or 1
+                a[key .. "Layout"] = nil
+            end
+
+            --[[ Everything, which is what these bars did before there was a way
+                 to say otherwise. Written rather than left to the default so an
+                 old profile reads the same as a new one. ]]--
+            if a[key .. "Buttons"] == nil then a[key .. "Buttons"] = 12 end
+        end
+    end },
+
+    --[[ **One Hide Art switch becomes three.**
+
+         It hid the gryphons, the bar background and the stance bar art
+         together, and there was no way to keep one and lose another. The three
+         it covered are now separate, and four more it never covered -- the XP
+         bar, the micro menu, the bag bar and the page arrows -- have switches
+         of their own.
+
+         Assigned unconditionally rather than guarded on being unset, because
+         defaults are merged *before* migrations run: by the time this executes
+         all three already hold their default `true`, so a guard would find them
+         present and leave somebody who had turned Hide Art off with three
+         switches turned back on. That is the same trap migration 22 fell into
+         with the tooltip colours. ]]--
+    { 24, function(p)
+        local a = p.modules and p.modules.actionbars
+        if not a then return end
+
+        if a.hideArt ~= nil then
+            local hidden = a.hideArt and true or false
+            a.hideGryphons = hidden
+            a.hideBarArt = hidden
+            a.hideStanceArt = hidden
+            a.hideArt = nil
+        end
+    end },
+
+    --[[ **Zone level ranges move from Quality Of Life to the Map.**
+
+         They arrived on the Quality Of Life page because that is where
+         quality-of-life things went, and they are about the map. The Map module
+         did not exist to put them on until now.
+
+         The key names are unchanged, so this is a move between tables rather
+         than a rename: whatever somebody had set carries across exactly.
+
+         Assigned unconditionally, because defaults merge *before* migrations
+         run -- by the time this executes the map module already holds its own
+         defaults, and a guard would find them present and discard the saved
+         answer. Migration 22 and migration 24 both learned this the hard
+         way. ]]--
+    { 25, function(p)
+        local qol = p.modules and p.modules.qol
+        local map = p.modules and p.modules.map
+        if not qol or not map then return end
+
+        if qol.zoneLevels ~= nil then
+            map.zoneLevels = qol.zoneLevels
+            qol.zoneLevels = nil
+        end
+
+        if qol.zoneFaction ~= nil then
+            map.zoneFaction = qol.zoneFaction
+            qol.zoneFaction = nil
+        end
+    end },
+
+    --[[ **The nameplate border stops being a target highlight and becomes a
+         threat readout.**
+
+         There were two switches on one surface: a flat colour that said "this
+         is the one you clicked", and the four-state threat colouring. The flat
+         one is gone -- the target's size and its glow say that already, twice
+         -- and its two keys go with it rather than sitting in every saved
+         profile forever. ]]--
+    { 26, function(p)
+        local n = p.modules and p.modules.nameplates
+        if not n then return end
+
+        n.targetBorder = nil
+        n.targetBorderColor = nil
+
+        --[[ Overriding a saved value, which is normally wrong and is right here
+             for the reason the schema 5 step gives: this shipped off, so
+             `false` is "never touched it" rather than "turned it off". The
+             border it colours is now the only thing on a plate that reports
+             threat, and the switch that used to occupy that surface has just
+             been deleted -- so leaving it off would upgrade a working plate
+             into a blank one. ]]--
+        n.threatBorder = true
+
+        --[[ The casting colour was gold to agree with the cast bar underneath
+             it, which is one state saying itself twice. Rewritten only where it
+             is still the shipped gold, so anybody who picked their own keeps
+             it. ]]--
+        local c = n.threatCastColor
+        if c and c[1] == 0.90 and c[2] == 0.80 and c[3] == 0.00 then
+            n.threatCastColor = { 0.25, 0.55, 1.00, 1 }
+        end
+    end },
+
+    --[==[ **The border wears the art the target ring was drawn in.**
+
+         `borderColor` was picked to sit under a flat one-pixel rectangle and is
+         now a tint on that art, so the shipped near-black is rewritten and a
+         colour somebody chose is not.
+
+         **`targetGlow` is deliberately not touched here**, though a version of
+         this step deleted it while that ring was gone. Defaults merge *before*
+         migrations run, so nil-ing a key does not restore its default -- it
+         removes it for the rest of that load, and the module reads a colour
+         that is not there. A setting that is coming back is left alone. ]==]
+    { 27, function(p)
+        local n = p.modules and p.modules.nameplates
+        if not n then return end
+
+        local c = n.borderColor
+        if c and c[1] == 0.06 and c[2] == 0.06 and c[3] == 0.06 then
+            n.borderColor = { 0.65, 0.65, 0.65, 1.00 }
+        end
+    end },
+
+    --[==[ **A changed default reaches nobody who already had a profile.**
+
+         `minimapIconSize` was raised from fourteen to twenty when the note
+         beside it was written -- "large enough to cover the client's own blip",
+         a size chosen against something else on screen rather than a taste. It
+         changed nothing for anybody already playing, because defaults are
+         merged into a profile once and a profile that has the key keeps its
+         own value forever.
+
+         So the marker went on being drawn at fourteen, which the crop above now
+         makes a genuine fourteen pixels and is still under the blip's size.
+
+         Moved only where it is still the old default. Fourteen chosen on
+         purpose is indistinguishable from fourteen inherited, and of the two
+         readings the one that changes somebody's deliberate setting is the
+         worse mistake -- but fourteen was never a choice anybody was offered:
+         it was the shipped value, and the slider has been in the panel for one
+         version. ]==]
+    { 28, function(p)
+        local m = p.modules and p.modules.map
+        if not m then return end
+
+        if m.minimapIconSize == 14 then m.minimapIconSize = 20 end
+    end },
+
+    --[[ Show Metrics is gone -- see the note where `ApplyMetrics` was. Only the
+         key goes: the readout it switched on is hidden by the client on every
+         load, so there is nothing in the world to put back. ]]--
+    { 29, function(p)
+        local q = p.modules and p.modules.qol
+        if not q then return end
+
+        q.showMetrics = nil
+    end },
+
+    --[==[ **The bag window is switched on once.**
+
+         It shipped off, so every profile written before this carries an
+         explicit `false` -- and a default flipped to true reaches none of them,
+         for the reason the step before this one gives at length: defaults are
+         merged into a profile once.
+
+         The result is a bag window that is finished, tested and invisible, and
+         nothing on screen says which switch is holding it shut.
+
+         **This overrides a saved value, which is normally wrong.** It is right
+         here for the same reason the schema 5 and 26 steps give: `false` is what
+         this shipped as rather than something somebody chose, and the reason it
+         shipped that way -- another bag addon in the install to defer to -- is
+         no longer the arrangement. Done once. Switching it off after this
+         sticks. ]==]
+    { 30, function(p)
+        p.modulesEnabled = p.modulesEnabled or {}
+        if p.modulesEnabled.bags == false then p.modulesEnabled.bags = nil end
+    end },
+
+    --[[ The bag grid went from ten columns to sixteen -- see the note beside the
+         default. Moved only where it is still the ten it shipped as, so a width
+         somebody set on the slider is kept. ]]--
+    { 31, function(p)
+        local b = p.modules and p.modules.bags
+        if not b then return end
+
+        if b.columns == 10 then b.columns = 16 end
+    end },
+
+    --[[ Empty bag slots are no longer drawn -- see the note beside the default.
+         Overriding a saved `true` because that is what this shipped as rather
+         than something somebody chose, and because the empties were also what
+         put the holes in the grid. Switching them back on after this sticks. ]]--
+    { 32, function(p)
+        local b = p.modules and p.modules.bags
+        if not b then return end
+
+        if b.showEmpty == true then b.showEmpty = nil end
+    end },
+
+    --[==[ **The world map markers are still drawing at twice their size.**
+
+         The same shape of miss as the minimap markers two steps ago, and for the
+         same reason. `playerIconSize` was corrected to thirteen when the markers
+         were cropped to their ink -- thirteen being what the client's own
+         marker actually is, measured off `WorldMapPartyIcon.blp`, which is 16x16
+         with ink from 1,1 to 14,14.
+
+         Before the crop the number was the size of a mostly empty *file*, so
+         twenty-four drew a twelve pixel mark and looked right. After it, the
+         number is the size of the mark, and the same twenty-four draws one
+         nearly twice the client's.
+
+         Defaults are merged into a profile once, so the correction reached
+         nobody who was already playing. Moved only from the two values this
+         shipped as -- twenty-four, and the sixteen that was read off the frame
+         rather than off the ink. ]==]
+    { 33, function(p)
+        local m = p.modules and p.modules.map
+        if not m then return end
+
+        if m.playerIconSize == 24 or m.playerIconSize == 16 then
+            m.playerIconSize = 13
+        end
+    end },
+
+    --[==[ **The four states go back to the border, and the glow marks the
+         target.**
+
+         Schema 26 moved them the other way and this moves them back, which is
+         worth being plain about rather than quietly flipping: the border is on
+         every plate, so a colour there answers "what is that one doing" about
+         the whole screen; the glow is on one plate by definition and could only
+         ever describe the plate you were already looking at.
+
+         Both switches are written rather than nil'd. Defaults merge before
+         migrations run, so nil-ing a key removes it for the rest of that load
+         and the module reads a setting that is not there -- the trap the schema
+         27 note records at length. ]==]
+    { 34, function(p)
+        local n = p.modules and p.modules.nameplates
+        if not n then return end
+
+        n.threatBorder = true
+        n.threatGlow = false
+
+        --[[ Rewritten only where it is still the gold this shipped, so a colour
+             somebody picked for their own glow survives. ]]--
+        local c = n.targetGlowColor
+        if c and c[1] == 1.00 and c[2] == 0.82 and c[3] == 0.35 then
+            n.targetGlowColor = { 1.00, 1.00, 1.00, 0.90 }
+        end
+    end },
+
+    --[==[ **The bag settings are thrown away and Bagnon's put in their place.**
+
+         Asked for in those words, and right: the old table described a window
+         that no longer exists. `blizzArt` picked whether to rebuild the client's
+         backpack behind the grid; `group` bucketed items by type on screen;
+         `showEmpty` hid the empty slots. Bagnon's grid is a picture of the bags
+         -- every slot, in bag order, nothing rearranged -- so all three describe
+         decisions that are no longer taken anywhere.
+
+         **Written rather than nil'd**, every one of them, for the reason the
+         schema 27 and 34 notes give at length: defaults merge into a profile
+         before migrations run, so clearing a key removes it for the rest of that
+         load and the module reads a setting that is not there. The three that
+         are nil'd are the three nothing reads any more, which is the only case
+         where clearing is safe.
+
+         **This overrides values somebody may have chosen**, which is normally
+         wrong and is the point here. The instruction was to start again from
+         Bagnon's defaults, and a column count carried forward from a window with
+         different geometry is exactly the kind of survival that makes a rebuild
+         look half-done. Done once; anything set after this sticks.
+
+         `protect` is not touched. It is not a Bagnon setting and not a layout
+         one -- it is the guard on selling or trading a favourite, and quietly
+         re-arming a switch somebody deliberately disarmed is not a migration. ]==]
+    --[==[ **Settings whose controls are gone, put back to their defaults.**
+
+         Removing a row does not remove the value behind it: `OB.Get` still
+         reads whatever a profile last saved, so somebody who once turned mob
+         health measurement off would have kept it off forever with nothing on
+         screen to explain why. That is the failure mode migration 22 and 24
+         both hit from the other direction.
+
+         Cleared rather than assigned, so the defaults merge decides the value
+         and there is one place that knows what it is. ]==]
+    { 36, function(p)
+        local u = p.modules and p.modules.unitframes
+
+        if u then
+            --[==[ **Two switches read once, into the choice they were.**
+
+                 Classic art wins where both were set: it is the one that
+                 changes which art is drawn at all, and compact is a variation
+                 on art that classic is not using. Read before anything else
+                 here clears keys, and only when the new one has not been
+                 written -- a profile that has already chosen is not
+                 re-derived. ]==]
+            if u.frameMode == nil then
+                if u.classicFrameArt then
+                    u.frameMode = "classic"
+                elseif u.compact == false then
+                    u.frameMode = "overhaul"
+                else
+                    u.frameMode = "compact"
+                end
+            end
+
+            u.classicFrameArt = nil
+            u.compact = nil
+
+            --[[ The name colour override, shared and per frame. Walked rather
+                 than listed: the per-frame keys are `<id>_nameColor`, and
+                 spelling out four ids here would be a second list to keep in
+                 step with the one in the module. ]]--
+            for key in pairs(u) do
+                if string.find(key, "nameColor", 1, true) then u[key] = nil end
+            end
+
+            --[[ The four frame switches. Cleared, so the defaults merge
+                 decides -- and it says all four. ]]--
+            u.replacePlayer = nil
+            u.replaceTarget = nil
+            u.replaceTargetTarget = nil
+            u.replacePet = nil
+
+            u.mobHealth = nil
+            u.mobHealthPrecision = nil
+            u.mobHealthStableMax = nil
+            u.feignHealth = nil
+            u.retarget = nil
+            u.plannedMobFleeIcon = nil
+        end
+
+        --[[ The client bar elements this addon replaces. Assigned rather than
+             cleared: the default changed from shown to hidden, and a profile
+             saved under the old one holds an explicit `false` that a merge
+             would keep. ]]--
+        local a = p.modules and p.modules.actionbars
+
+        --[[ Nameplate settings whose controls are gone: the two health
+             estimate numbers, and the five hide-health-bar switches that
+             repeated the five show-a-plate switches above them. Cleared so the
+             defaults merge decides. ]]--
+        local n = p.modules and p.modules.nameplates
+
+        if n then
+            n.healthEstimateHits = nil
+            n.healthEstimateDamage = nil
+            n.hideEnemyNpcHealth = nil
+            n.hideNeutralNpcHealth = nil
+            n.hideEnemyPlayerHealth = nil
+            n.hideFriendlyNpcHealth = nil
+            n.hideFriendlyPlayerHealth = nil
+        end
+
+        --[[ The edit gesture is unconditional now. Cleared rather than left
+             at whatever was saved: a profile holding `false` would have kept
+             the only drag-anything gesture switched off with nothing on screen
+             left to explain it. ]]--
+        p.editHotkey = nil
+
+        if a then
+            --[[ The bag button lost its switch and the client's bag slots are
+                 hidden for good, so a saved `false` here would leave somebody
+                 with no way to open their bags from the bar. ]]--
+            a.bagButton = nil
+
+            a.hideBarArt = nil
+            a.hideStanceArt = nil
+            a.hideXP = true
+            a.hideMicroMenu = true
+            a.hidePerformanceBar = true
+            a.hideBags = true
+        end
+    end },
+
+    --[==[ **Numbered 37, not 35, and that was a real bug for one version.**
+
+         The steps run in list order and each one that fires writes its own
+         number into the profile. An entry numbered *below* one earlier in the
+         list can therefore never fire: by the time the loop reaches it the
+         schema is already higher.
+
+         This was written as 35 and appended after a step numbered 36, on the
+         assumption that the end of the list held the highest number. It did
+         not. So the whole bag reset -- the thing the rewrite depends on to
+         clear settings describing a window that no longer exists -- was dead
+         code that ran for nobody.
+
+         The check at the bottom of the suite now walks this list and fails if
+         it is not ascending, which is the only way to notice: nothing about a
+         migration that quietly does not run is visible from the game. ]==]
+    { 37, function(p)
+        local b = p.modules and p.modules.bags
+        if not b then return end
+
+        --[[ Settings for a window that is gone. Safe to clear precisely because
+             nothing reads them. ]]--
+        b.blizzArt = nil
+        b.showEmpty = nil
+        b.group = nil
+        b.showMoney = nil
+
+        --[[ `FrameDefaults` and the `inventory` profile out of Bagnon's
+             `core/api/settings.lua`, transcribed. ]]--
+        b.columns = 10
+        b.bankColumns = 14
+        b.itemScale = 1
+        b.spacing = 2
+        b.bagBreak = 0
+        b.reverseBags = false
+        b.reverseSlots = false
+        b.showBags = false
+        b.hiddenBags = {}
+
+        b.bagToggle = true
+        b.sort = true
+        b.search = true
+        b.money = true
+
+        b.color = { 0, 0, 0, 0.5 }
+        b.borderColor = { 1, 1, 1, 1 }
+
+        b.glowQuality = true
+        b.glowPoor = true
+        b.glowAlpha = 0.5
+        b.slotBackground = true
+
+        --[==[ **And the pins, which were account-wide rather than in here.**
+
+             They recorded "this item draws at square nine", which only meant
+             anything while the window arranged items itself. Left behind they
+             are a table nothing reads that grows every time somebody who
+             remembers the feature tries it. Cleared here because this is the
+             step that removes the feature, even though it reaches outside the
+             profile to do it. ]==]
+        if type(EquadisClassicOverhaulDB) == "table" then
+            EquadisClassicOverhaulDB.bagPins = nil
+            EquadisClassicOverhaulDB.bagGroups = nil
+        end
+    end },
+
+    --[==[ **The client's minimap dots come back on.**
+
+         Hiding them means handing the engine a transparent blip sheet, and the
+         one that shipped was 8x8 -- too small for the cells the engine indexes
+         out of it, so it drew vanilla's missing-texture green square on the
+         minimap instead of drawing nothing.
+
+         The sheet is the size of the client's own now and the setting has been
+         defaulted off, but a default only reaches a profile that has never seen
+         the key. Anybody who logged in on the version in between has `true`
+         written down and would keep the green square until they found the
+         switch.
+
+         Written to `false` rather than nil'd, for the reason the schema 27 note
+         gives at length: defaults merge before migrations run, so clearing a
+         key removes it for the rest of that load. ]==]
+    { 38, function(p)
+        local m = p.modules and p.modules.map
+        if not m then return end
+
+        m.hideDefaultBlips = false
+    end },
+
+    --[==[ **The font outline switch, read as the weight it was.**
+
+         It is a list now -- None, Thin, Thick -- so an old `true` is Thin, which
+         is the only outline there was, and `false` is None.
+
+         Both places it can be stored are walked: the profile's own key, and each
+         module's, because a module's look override lives in its own settings
+         rather than in a table of its own. See `OB.Look`.
+
+         Written rather than cleared, for the reason schema 27 gives at length:
+         the defaults are merged before migrations run, so nil'ing a key removes
+         it for the rest of that load rather than falling back to the
+         default. ]==]
+    { 39, function(p)
+        local function convert(t)
+            if type(t) ~= "table" then return end
+            if t.fontOutline == true then t.fontOutline = 2 end
+            if t.fontOutline == false then t.fontOutline = 1 end
+        end
+
+        convert(p)
+
+        if type(p.modules) == "table" then
+            for _, m in pairs(p.modules) do convert(m) end
+        end
+    end },
+
+    --[==[ **Every learned zone scale is thrown away.**
+
+         `waypoints.lua` had the world axes swapped against `map.lua` -- see the
+         note on `WorldPosition` -- so every number `CalibrateZone` wrote was a
+         north displacement divided by an east-west map fraction. Silithus had
+         learned 10.4 yards per map width against a true figure near 4900, and a
+         waypoint most of a zone away read as five yards.
+
+         Cleared rather than corrected, because there is nothing in a wrong
+         reading to correct *from*: the pair of samples that produced it is long
+         gone. A cleared zone re-learns itself within a few seconds of walking,
+         which is cheaper than carrying a number that reads a mile as five
+         yards. ]==]
+    { 40, function(p)
+        local w = p.modules and p.modules.waypoints
+        if not w then return end
+
+        w.zoneYards = nil
+    end },
+
+    --[==[ **The arrow's colour switch becomes a choice of two schemes.**
+
+         `colorByFacing` was a boolean, and its off state had no colour setting
+         at all -- the arrow simply went white. The replacement names both
+         schemes and gives each its own colours, so an old profile has to say
+         which of the two it was already in.
+
+         Written rather than cleared, for the reason schema 27 gives at length:
+         defaults merge before migrations run, so nil-ing a key removes it for
+         the rest of that load rather than falling back to the default. ]==]
+    { 41, function(p)
+        local w = p.modules and p.modules.waypoints
+        if not w then return end
+
+        if w.colorByFacing == false then
+            w.arrowColorMode = 1
+        elseif w.colorByFacing == true then
+            w.arrowColorMode = 2
+        end
+
+        w.colorByFacing = nil
+    end },
+
+    --[==[ **Everybody's bars are locked.**
+
+         `locked` is edit mode's flag -- `OB.SetEditMode` writes `not on` into it
+         -- and it shipped `false`, which is the unlocked state without edit mode
+         being on. An unlocked HUD bar takes the mouse, at the same strata the
+         action buttons are drawn at, so a click landing on one never reached the
+         spell underneath.
+
+         Anybody who has used edit mode already has `true` written down, because
+         leaving it writes that. So the only profiles this moves are the ones
+         that never entered it -- which are exactly the ones with the fault. ]==]
+    { 42, function(p)
+        p.locked = true
+    end },
+
+    --[==[ **The icon fills the slot now, as it does on the client's own buttons.**
+
+         The three-pixel inset existed to give a mis-sized ring something to sit
+         on: `UI-Quickslot2` was drawn at the button's size, so its rim landed
+         inside the icon and the inset kept the picture out from under it. With
+         the ring sized the way the client sizes it (v0.99.288) the rim lands on
+         the icon's edge and the inset is a dark band round every item.
+
+         Only the untouched default moves. Somebody who set 3 on purpose set the
+         same number the default was, and there is no telling those apart -- but
+         nobody chose a band, and a slider is one drag away. ]==]
+    { 43, function(p)
+        local b = p.modules and p.modules.bags
+        if b and b.iconInset == 3 then b.iconInset = 0 end
+    end },
 }
 
 function OB.RunProfileMigrations(p)
@@ -1041,8 +1719,94 @@ end
 -- can never re-import over a layout that has since been tuned.
 -- ---------------------------------------------------------------------------
 
+--[==[ **A setting that moved pages has to take its value with it.**
+
+     The navigation was reorganised so that settings sit where somebody would
+     look for them, and that means keys changing module. A key that changes
+     module changes saved table -- so without this, everybody who had turned
+     item borders off finds them on again, and the only clue is that the setting
+     is somewhere else now.
+
+     Copied rather than moved-and-trusted: the old value is only used when the
+     new one has never been written, so a profile that has already been through
+     this keeps whatever it was set to afterwards. Then the old key is cleared,
+     because a stale copy left behind is a value that will look authoritative to
+     somebody reading the saved variables later. ]==]
+local function migrateKeys(db, flag, fromId, toId, keys)
+    if db.migrated[flag] then return false end
+    db.migrated[flag] = true
+
+    for _, profile in pairs(db.profiles or {}) do
+        local from = profile.modules and profile.modules[fromId]
+
+        if from then
+            profile.modules[toId] = profile.modules[toId] or {}
+            local to = profile.modules[toId]
+
+            for i = 1, table.getn(keys) do
+                local key = keys[i]
+
+                if from[key] ~= nil then
+                    if to[key] == nil then to[key] = from[key] end
+                    from[key] = nil
+                end
+            end
+        end
+    end
+
+    return true
+end
+
 function OB.RunDBMigrations(db)
     db.migrated = db.migrated or {}
+
+    --[==[ **Weapon buffs kept the size they were being drawn at.**
+
+         They used to borrow the buff row's numbers, so somebody who had made
+         their buffs small had made their poisons small too. Splitting them into
+         their own group with their own defaults would have snapped those icons
+         back to thirty pixels on upgrade -- a change nobody asked for, in a
+         setting they had deliberately moved.
+
+         So the old shared values are copied across once. Only where the new key
+         has never been written, so this cannot undo a later decision. ]==]
+    if not db.migrated.weaponBuffGroup then
+        db.migrated.weaponBuffGroup = true
+
+        for _, profile in pairs(db.profiles or {}) do
+            local buffs = profile.modules and profile.modules.buffframes
+
+            if buffs then
+                if buffs.enchantSize == nil then
+                    buffs.enchantSize = buffs.buffSize
+                end
+                if buffs.enchantSpacingX == nil then
+                    buffs.enchantSpacingX = buffs.buffSpacingX
+                end
+                if buffs.enchantGrowX == nil then
+                    buffs.enchantGrowX = buffs.buffGrowX
+                end
+            end
+        end
+    end
+
+    --[==[ Item borders and model dragging were on the Quality Of Life page,
+         which is where settings went when nobody had decided where they
+         belonged. Both are about the character sheet.
+
+         The Character Panel ships enabled for anybody who had either of these
+         on, because otherwise the move reads as the features being removed. ]==]
+    if migrateKeys(db, "characterPanelSplit", "qol", "characterpanel",
+            { "rarityBorders", "modelRotate", "modelRotateSpeed" }) then
+        for _, profile in pairs(db.profiles or {}) do
+            local panel = profile.modules and profile.modules.characterpanel
+
+            if panel and (panel.rarityBorders or panel.modelRotate)
+                    and profile.modulesEnabled then
+                profile.modulesEnabled.characterpanel = true
+            end
+        end
+    end
 
     if not db.migrated.roguebars then
         db.migrated.roguebars = true
@@ -1065,11 +1829,101 @@ function OB.RunDBMigrations(db)
         end
     end
 
+    --[[ **The standalone unit frame addon's settings, imported once.**
+
+         This slot said "reserved" for a long time and did nothing, so somebody
+         switching from the addon this one replaces arrived at default settings
+         and had to set everything again -- while their old choices sat in
+         `UnitFramesConfig` untouched.
+
+         The four switches are client CVars rather than addon settings, so they
+         survive the addon being uninstalled and are worth reading whether or
+         not its saved variables are still there.
+
+         Runs once, keyed on the store's version. Anything already answered in
+         this addon is left alone: an import is for a profile that has not been
+         told yet, not a periodic overwrite of somebody's later choices. ]]--
+    if db.version and db.version < 2 then
+        --[[ 1 = value/max, 2 = value, 3 = percent, 4 = value (percent),
+             5 = none -- the standalone's numbering, from its own comment. ]]--
+        local FORMATS = { "max", "value", "percent", "valuepct", "none" }
+
+        for _, profile in pairs(db.profiles or {}) do
+            local uf = profile.modules and profile.modules.unitframes
+
+            if uf then
+                local old = UnitFramesConfig
+
+                if type(old) == "table" then
+                    if uf.healthText == nil and FORMATS[old.HealthFormat] then
+                        uf.healthText = FORMATS[old.HealthFormat]
+                    end
+
+                    if uf.powerText == nil and FORMATS[old.PowerFormat] then
+                        uf.powerText = FORMATS[old.PowerFormat]
+                    end
+
+                    if uf.healthSize == nil then uf.healthSize = old.HPFontSize end
+                    if uf.powerSize == nil then uf.powerSize = old.MPFontSize end
+                    if uf.nameSize == nil then uf.nameSize = old.NameTextFontSize end
+
+                    if uf.healthX == nil then uf.healthX = old.HealthTextX end
+                    if uf.healthY == nil then uf.healthY = old.HealthTextY end
+                    if uf.powerX == nil then uf.powerX = old.PowerTextX end
+                    if uf.powerY == nil then uf.powerY = old.PowerTextY end
+                    if uf.nameX == nil then uf.nameX = old.NameTextX end
+                    if uf.nameY == nil then uf.nameY = old.NameTextY end
+
+                    if uf.decimals == nil then uf.decimals = old.Decimals end
+                    if uf.nameOutline == nil then uf.nameOutline = old.NameOutline end
+                    if uf.colorText == nil then uf.colorText = old.ColoredSbText end
+                    if uf.hidePetText == nil then uf.hidePetText = old.HidePetText end
+                    if uf.statusGlow == nil then uf.statusGlow = old.StatusGlow end
+
+                    if uf.classColorHealth == nil then
+                        uf.classColorHealth = old.PlayerClassColor
+                    end
+
+                    if uf.npcClassColor == nil then
+                        uf.npcClassColor = old.NPCClassColor
+                    end
+                end
+
+                --[==[ **The four CVars, which outlive the addon that set them
+                     -- and which most people never had at all.**
+
+                     Read through `OB.CVar`. `GetCVar` raises on a name the
+                     client does not know, and the `type(GetCVar) == "function"`
+                     that used to guard this checks the function and says nothing
+                     about the name. On any install that never ran the donor
+                     addon, this threw inside `LoadConfig` -- which is not one
+                     feature failing, it is the addon not loading. ]==]
+                if uf.classPortrait == nil then
+                    uf.classPortrait = OB.CVar("ufClassPortrait") == "1"
+                end
+
+                if uf.darkMode == nil then
+                    uf.darkMode = OB.CVar("ufDarkMode") == "1"
+                end
+
+                if uf.improvedPet == nil then
+                    uf.improvedPet = OB.CVar("ufImprovedPet") == "1"
+                end
+
+                if uf.compact == nil then
+                    uf.compact = OB.CVar("ufCompactMode") == "1"
+                end
+            end
+        end
+    end
+
     -- reserved: v2 TWT_CONFIG -> modules.threat
     --           v3 ShaguDPS_Config -> modules.meter
-    --           v4 UnitFramesConfig + the four uf* CVars -> modules.unitframes
+    --           (v4 UnitFramesConfig import is implemented above)
 
-    db.version = 1
+    --[[ Two now: the unit frame import above runs once, for stores written
+         before it existed. ]]--
+    db.version = 2
 end
 
 -- ---------------------------------------------------------------------------
@@ -1147,7 +2001,7 @@ function OB.LoadConfig()
 
          `OB.Roster()` is the read path and answers a table per player. It grows
          with the number of people you have seen, which is the cost of knowing
-         anything about them, and `/eqob roster forget` is the way back. ]]--
+         anything about them, and `/eq roster forget` is the way back. ]]--
     db.roster = db.roster or {}
     OB.roster = db.roster
 
@@ -1173,6 +2027,15 @@ function OB.LoadConfig()
          list that destroys things is the worst possible failure: it works, it
          just works on yesterday's answer. ]]--
     db.trash = db.trash or ""
+
+    --[[ **Automatic loot-roll lists.**
+
+         These are account-wide for the same reason as the never-keep list:
+         "always Need Corrupted Sand" is a statement about the item, not about
+         the current profile or character. The panel edits comma-separated text
+         directly, and the slash commands append to these same strings. ]]--
+    db.autoNeed = db.autoNeed or ""
+    db.autoGreed = db.autoGreed or ""
 
     --[[ **Names UnitScan watches for**, account-wide for the same reason the
          never-keep list is: a rare spawn is not a character-specific UI
@@ -1380,6 +2243,13 @@ end
      was the one that never got it. ]]--
 local function reload()
     OB.LoadConfig()
+
+    --[[ The look cache is keyed by module and refilled on every read, so this
+         is hygiene rather than a fix: a module the old profile had and the new
+         one does not would otherwise keep a table nothing asks for again.
+         `ForgetLooks` was written for exactly this call and nothing made it. ]]--
+    if OB.ForgetLooks then OB.ForgetLooks() end
+
     OB.BindSlots()
     OB.Refresh(true)
     OB.RefreshPanel()
@@ -1459,6 +2329,8 @@ function OB.ResetAll()
     local db = EquadisClassicOverhaulDB
     local roster = db and db.roster
     local trash = db and db.trash
+    local autoNeed = db and db.autoNeed
+    local autoGreed = db and db.autoGreed
 
     EquadisClassicOverhaulDB = nil
     reload()
@@ -1473,13 +2345,23 @@ function OB.ResetAll()
          reset that dropped it would do exactly that the next time somebody
          retyped it from memory and got a name slightly wrong. ]]--
     if trash then EquadisClassicOverhaulDB.trash = trash end
+    if autoNeed then EquadisClassicOverhaulDB.autoNeed = autoNeed end
+    if autoGreed then EquadisClassicOverhaulDB.autoGreed = autoGreed end
 
     Say("every profile restored to defaults. What you know about other "
-            .. "players is kept -- '/eqob roster forget' clears that.")
+            .. "players is kept -- '/eq roster forget' clears that.")
 end
 
 function OB.TrashList()
     return (EquadisClassicOverhaulDB and EquadisClassicOverhaulDB.trash) or ""
+end
+
+function OB.AutoNeedList()
+    return (EquadisClassicOverhaulDB and EquadisClassicOverhaulDB.autoNeed) or ""
+end
+
+function OB.AutoGreedList()
+    return (EquadisClassicOverhaulDB and EquadisClassicOverhaulDB.autoGreed) or ""
 end
 
 --[[ How much is in there, split by how much of it is actually useful. A name

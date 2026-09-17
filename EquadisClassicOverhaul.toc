@@ -1,13 +1,13 @@
 ## Interface: 11200
 ## Title: Equadis' Classic Overhaul
-## Version: 0.86.4
-## X-AtlasCFM-Version: 1.60
+## Version: 0.99.297
+## X-AtlasCFM-Version: 1.70
 ## Author: Equadis
 ## Notes: All-in-one interface package with bundled Atlas-CFM, AtlasLoot, and embedded pfQuest/Turtle loot data.
 ## X-Website: https://github.com/eqomdx/EquadisClassicOverhaul
 ## X-License: GPL-3.0-or-later
-## SavedVariables: EquadisClassicOverhaulDB, AtlasCFMOptions
-## SavedVariablesPerCharacter: AtlasCFMCharDB, AtlasLootCharDB
+## SavedVariables: EquadisClassicOverhaulDB, AtlasCFMOptions, TurtleMail_AutoCompleteNames, TurtleMail_Favourites
+## SavedVariablesPerCharacter: AtlasCFMCharDB, AtlasLootCharDB, TurtleMail_To, TurtleMail_Point, TurtleMail_Log
 ## OptionalDeps: pfUI, EquipCompare, EQCompare
 
 # Bundled AtlasLoot TW data provider (user-supplied AtlasLoot commit 78022f8).
@@ -29,7 +29,12 @@ Instances\Instances.xml
 WorldBosses\WorldBosses.xml
 TableRegister\TableRegister.xml
 
-# Bundled Atlas-CFM-DestinationClick main (commit 9d92e187).
+# Bundled Atlas-CFM 1.70 (the DBC-audited build with the cache filter fix).
+# Upgraded from 1.60 on 2026-09-05: gentler login (the profession index is
+# built in one pass and no longer warms the item cache during load), an
+# item cache that never negative-caches a page, ClassicAPI item loads where
+# the client has them, and saved options that a new character no longer
+# resets. ECO's own edits to it are listed in NOTICE.
 # Its own GameTooltip decorator is omitted in CFMLoot/LootInit.xml so ECO has
 # one tooltip owner; map, destination-click and database systems remain intact.
 CFMAtlas\AtlasInit.xml
@@ -38,7 +43,9 @@ CFMQuest\QuestInit.xml
 
 # foundation
 core.lua
+capabilities.lua
 config.lua
+profilecodes.lua
 
 # embedded vanilla vendor sell values; live/learned server values override these
 data\vendor_sell.lua
@@ -48,10 +55,16 @@ pricing.lua
 
 # generated ordinary-world loot snapshot (pfQuest + pfQuest-turtle)
 data\pfquest_loot.lua
+# generated OctoWow item names, from the server's own database
+data\octowow_items.lua
 
 # rendering and placement
 render.lua
+skin.lua
 layout.lua
+
+# cross-cutting edit mode and the alignment grid, above the modules it unlocks
+editmode.lua
 
 # driver
 hud.lua
@@ -72,29 +85,68 @@ modules\druidmana.lua
 # the only ones the Modules page lists
 modules\parser.lua
 modules\casts.lua
+# The debuff duration table, loaded before the module that reads it. From
+# ShaguPlates under MIT; the notice sits beside it in Libs/.
+# Spelled lower-case on purpose: the two files assign onto the addon's own
+# namespace, which is rebuilt on every boot, so the suite must run them per
+# boot rather than once like the Ace libraries under `Libs/`. Windows does
+# not care about the case; the harness's load-once rule does.
+libs\debuffdurations.lua
+libs\buffdurations.lua
 modules\auras.lua
 modules\roster.lua
 modules\actionbars.lua
+
+# The DragonflightUI-Reforged / VCB migration. The Dragonflight *look* -- the
+# button plates and the bar backing -- has been dropped; what was worth taking
+# was the layout engine, which lives in actionbars.lua above.
+modules\buffframes.lua
+modules\partyframes.lua
+modules\raidframes.lua
+
 modules\nameplates.lua
 modules\threat.lua
 modules\damage.lua
 modules\chat.lua
 modules\chatbehaviour.lua
 modules\qol.lua
+modules\characterpanel.lua
+modules\bags.lua
+modules\auction.lua
 modules\unitframes.lua
 modules\unitscan.lua
 modules\itemdatabase.lua
 modules\itembrowser.lua
 modules\tooltip.lua
 
-# the roadmap: subsystems that are listed and not yet written. No behaviour, and
-# each moves to a file of its own the moment it has any.
-modules\planned.lua
+# The addon list, which 1.12 has no in-world equivalent of. Not a module: it
+# registers no settings and owns one window, like the item browser above.
+modules\addonlist.lua
+modules\map.lua
+modules\waypoints.lua
 
 # interface
 options.lua
+setup.lua
+
+profiler.lua
 slash.lua
 
+# Bundled TurtleMail 1.4.5 by shirsig/sica -- the mailbox, which the client
+# gives you one letter at a time and no way to find anybody.
+#
+# Loaded last because it takes over the client's own mail frames and wants them
+# built: its XML anchors to MailFrame, InboxFrame and SendMailFrame.
+#
+# Two things had to change to bundle it. Its ADDON_LOADED compared `arg1`
+# against "TurtleMail" and now accepts this addon's name as well, or the event
+# it needs is the one event it rejects. And the three texture paths in its XML
+# point into this folder rather than into an addon that may not be installed.
+#
+# Its saved variables are declared above under their own names, so a standalone
+# copy and this one read the same lists.
+Mail\TurtleMail.xml
+
 # verification -- depends on everything above, and nothing in it runs until
-# /eqob selftest asks it to
+# /eq selftest asks it to
 selftest.lua

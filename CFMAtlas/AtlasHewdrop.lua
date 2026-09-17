@@ -647,11 +647,51 @@ function Hewdrop:Refresh(level)
     Refresh(self, level)
 end
 
--- Hook WorldFrame to close menu on click
+--[==[ **Close the menu on a click in the world -- without eating the click.**
+
+     This used to set `OnMouseDown` on `WorldFrame` and nothing else, and close
+     unconditionally. Two problems, and they were reported together as the
+     camera not turning and clicks not selecting anything.
+
+     **Only half the pair was handled.** Turning the camera is a press, a drag
+     and a release. Installing a Lua handler on the press while leaving the
+     release alone gives the engine a mismatched pair, and what comes back is a
+     press that starts nothing.
+
+     **A drag is not a click.** Closing on mouse-down means the menu shuts the
+     instant you begin turning the camera, which is the same gesture as
+     click-and-hold to look around. The close belongs on release, and only when
+     the cursor has not moved -- which is the test Dewdrop-2.0 has always used
+     for exactly this, a few thousand lines away in this same addon.
+
+     Both original scripts are captured and called, in case something else got
+     here first. `GetScript` answering nil is the normal case: the client's own
+     camera handling is engine-level rather than a Lua script, which is why
+     saving it and calling it back was never going to restore anything. ]==]
 local WorldFrame_OnMouseDown = WorldFrame:GetScript("OnMouseDown")
+local WorldFrame_OnMouseUp = WorldFrame:GetScript("OnMouseUp")
+
+local hewdropDownX, hewdropDownY
+
 WorldFrame:SetScript("OnMouseDown", function()
+    hewdropDownX, hewdropDownY = GetCursorPosition()
     if WorldFrame_OnMouseDown then WorldFrame_OnMouseDown() end
-    Hewdrop:Close()
+end)
+
+WorldFrame:SetScript("OnMouseUp", function()
+    local x, y = GetCursorPosition()
+
+    --[[ Four pixels of slack, because a hand that means to click still moves a
+         little. Anything further is somebody turning to look at something. ]]--
+    if hewdropDownX and x
+            and math.abs(x - hewdropDownX) < 4
+            and math.abs(y - hewdropDownY) < 4 then
+        Hewdrop:Close()
+    end
+
+    hewdropDownX, hewdropDownY = nil, nil
+
+    if WorldFrame_OnMouseUp then WorldFrame_OnMouseUp() end
 end)
 
 -- EXPORT FOR COMPATIBILITY

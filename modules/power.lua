@@ -58,15 +58,52 @@ OB.tickers = {}
      gain arriving *on* the beat is a real tick against a nearly full bar, which
      is why the size test only applies while the timing is also suspect.
 
-     The pulse itself stays at **exactly two seconds**. The UNIT_ENERGY event is
-     observed on a rendered frame after the server change has happened, so the
-     interval between two events contains frame/latency jitter. Using that noisy
-     interval as the sweep speed made the ticker visibly breathe -- one sample
-     could make it run a little slow, the next a little fast. Real ticks are
-     therefore used to correct only the *phase* (`start`), never the cadence.
-     Every accepted tick snaps the sweep back onto the server pulse while the
-     marker continues to travel at one stable speed between observations. ]]--
+     **How fast.** The cadence is *learned slowly*, and this has now been wrong
+     in both directions.
+
+     It began as the raw interval between two observations, which made the
+     ticker visibly breathe: `UNIT_ENERGY` is noticed on a rendered frame after
+     the server has already moved the number, so a single sample carries frame
+     and latency jitter and one bad one could make the sweep run visibly slow or
+     fast.
+
+     The reaction was to nail it to exactly two seconds and use real ticks only
+     to correct the phase. That removed the breathing and introduced the
+     opposite fault: on a realm whose pulse is not exactly two seconds the sweep
+     runs at the wrong speed for ever, so the energy arrives *before* the marker
+     reaches the end of the bar, every single cycle. Snapping the phase back
+     hides it for an instant and then it happens again.
+
+     Neither the raw sample nor the constant is right. The sample is right and
+     the *weighting* was wrong: the interval is folded into a running estimate
+     that starts at two seconds and moves a fraction of the way to each new
+     observation, so jitter averages out and a genuinely different cadence is
+     still followed within a few ticks. It is clamped, because the estimate also
+     sets the windows that decide what counts as a tick and a runaway there
+     would reject everything.
+
+     Only clean samples are fed in: a full tick, on the beat, at a plausible
+     distance from the one before it. A partial gain against a nearly full bar
+     says nothing about cadence, and the double-length gap after a rejected
+     observation says something actively wrong. ]]--
 local PULSE_PERIOD = 2
+
+--[[ The estimate never leaves this range. Every pulse anyone plays on is two
+     seconds or near enough; these are wide enough for a server that differs and
+     tight enough that the tick windows stay meaningful. ]]--
+local PULSE_MIN = 1.5
+local PULSE_MAX = 2.5
+
+--[[ How much of the error one clean sample is allowed to correct, once enough
+     of them have been seen. Early samples count for more -- see the prior
+     below -- so the estimate settles in a handful of ticks rather than a
+     minute, and then stops moving perceptibly. ]]--
+local PULSE_WEIGHT_FLOOR = 0.08
+
+--[[ The estimate starts as if two seconds had already been observed three
+     times. Without a prior the first sample would carry all the weight and be
+     exactly the single noisy reading this is here to stop trusting. ]]--
+local PULSE_PRIOR = 3
 
 --[[ A gain this much of a period early cannot be the tick. Keep the window
      loose enough that a genuine pulse observed a little early because of frame
@@ -83,6 +120,14 @@ OB.tickers.pulse = {
         t.period = PULSE_PERIOD
         t.lastTick = nil
         t.tickSize = nil
+
+        -- The beat is unknown again, so a bigger gain may re-anchor freely
+        -- until one has been timed against another. See the accept branch.
+        t.tickConfirmed = nil
+
+        -- and the cadence goes back to the assumption, not to whatever the
+        -- previous form or power type happened to pulse at
+        t.periodSamples = nil
     end,
 
     Observe = function(t, now, current, previous)
@@ -98,8 +143,8 @@ OB.tickers.pulse = {
             local partial = t.tickSize and (diff < t.tickSize)
             local offBeat = since and (since < t.period * PULSE_ONBEAT)
 
-            --[[ A gain bigger than anything seen so far is believed whatever the
-                 timing says, because the timing is only as good as the anchor it
+            --[[ A gain bigger than anything seen so far is believed *on the
+                 timing*, because the timing is only as good as the anchor it
                  came from -- and a bigger gain is proof that anchor was not a
                  full tick.
 
@@ -108,18 +153,85 @@ OB.tickers.pulse = {
                  the cycle whatever it was; if it was a two-energy refund, the
                  next real tick is ten times larger and takes the phase back at
                  once instead of over the two cycles the timing test alone would
-                 need.
-
-                 The price is Thistle Tea: a hundred energy is bigger than any
-                 tick, so it re-anchors and the phase is wrong until the tick
-                 after next. A five minute cooldown costing one cycle is the
-                 right side of this trade against every login costing two. ]]--
+                 need. That still works: the refund sets `lastTick`, the real
+                 tick lands a full period later, and a period later is not
+                 early. ]]--
             local biggest = diff > (t.tickSize or 0)
 
-            if biggest or (not early and not (partial and offBeat)) then
+            --[[ **Nothing arrives early once the beat is known, however big it
+                 is.**
+
+                 This read `biggest or (...)`, so any gain larger than the
+                 running estimate re-anchored the cycle no matter when it landed
+                 -- and the preamble above names the case that breaks it:
+                 Relentless Strikes pays 25 against a 20 energy tick, on every
+                 finisher. Each one moved `start` into the middle of the beat,
+                 and the genuine tick that followed then read as early and was
+                 thrown away. On a rogue that is most of a fight, which is what
+                 "the spark is not synced to the ticker" looks like from the
+                 outside. Thistle Tea is the same case on a longer timer.
+
+                 **But only once the beat is known**, which is what
+                 `tickConfirmed` is for. `biggest` has a real job at bootstrap:
+                 the first gain after a login or a form change anchors the cycle
+                 whatever it was, and if that was a two energy refund then the
+                 real tick -- ten times larger, and arriving whenever it arrives
+                 -- has to be allowed to take the phase back. Vetoing early gains
+                 from the very first observation would leave the sweep anchored
+                 to the refund for a full cycle.
+
+                 So the veto applies only against an anchor that has itself been
+                 confirmed by timing: a gain accepted a proper interval after the
+                 one before it. Until then a bigger gain is still better evidence
+                 than an anchor nobody has checked. ]]--
+            local settled = early and t.tickConfirmed
+
+            if not settled
+                    and (biggest or (not early and not (partial and offBeat))) then
                 if diff > (t.tickSize or 0) then t.tickSize = diff end
 
-                t.period = PULSE_PERIOD
+                --[[ **Confirmed means "a proper interval after the last one".**
+
+                     Not merely accepted: the bootstrap path accepts a refund
+                     with no history at all, and an anchor nobody has timed is
+                     exactly the one a bigger gain should still be allowed to
+                     overrule. `since` has to exist -- so there was a previous
+                     tick to measure from -- and the gap has to be a real one.
+
+                     Once set it stays set. The cadence does not change while the
+                     character does; `Reset` clears it, which is a login, a form
+                     change, or a new power type. ]]--
+                if since and not early then t.tickConfirmed = true end
+
+                --[[ **The cadence, from clean samples only.**
+
+                     `since` has to be a plausible tick interval in its own
+                     right: after a rejected observation the next accepted gain
+                     is two periods away, and feeding that in would teach the
+                     sweep to run at half speed. `partial` is excluded for the
+                     same reason -- a small gain against a nearly full bar is a
+                     real tick, and its *timing* is fine, but it tends to arrive
+                     alongside the cap and is not worth the risk.
+
+                     Weighted by how many samples have been seen, so the estimate
+                     settles quickly and then holds still. See PULSE_PRIOR. ]]--
+                if since and not early and not partial
+                        and since >= PULSE_MIN and since <= PULSE_MAX then
+                    t.periodSamples = (t.periodSamples or PULSE_PRIOR) + 1
+
+                    local weight = 1 / t.periodSamples
+                    if weight < PULSE_WEIGHT_FLOOR then
+                        weight = PULSE_WEIGHT_FLOOR
+                    end
+
+                    local blended = (t.period * (1 - weight)) + (since * weight)
+
+                    if blended < PULSE_MIN then blended = PULSE_MIN end
+                    if blended > PULSE_MAX then blended = PULSE_MAX end
+
+                    t.period = blended
+                end
+
                 t.lastTick = now
                 t.start = now
                 return true

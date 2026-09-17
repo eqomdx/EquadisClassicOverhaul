@@ -39,6 +39,7 @@ local M = OB.RegisterModule({
         autoTarget = false,
         addMarkerOnTarget = false,
         reAlertMinutes = 2,
+        stopAfterElite = true,
     },
 
     options = {
@@ -48,10 +49,23 @@ local M = OB.RegisterModule({
           function() OB.modules.unitscan:AddInputTarget() end },
         { "Remove Target", "__a_remove", "action",
           function() OB.modules.unitscan:RemoveInputTarget() end },
-        { "List All Targets", "__a_list", "action",
-          function() OB.modules.unitscan:PrintTargets() end },
         { "Clear All Targets", "__a_clear", "action",
           function() OB.modules.unitscan:RequestClearTargets() end },
+
+        --[==[ **The list is on the page now, so there is nothing to print.**
+
+             "List All Targets" wrote them into the chat frame, which is a
+             strange place to look for the contents of a setting you are standing
+             in front of -- and it scrolled away behind whatever was said next.
+
+             `/us` with no argument still prints them, because a list you can
+             paste to somebody is worth keeping. ]==]
+        { "", "__c_targets", "column", 2 },
+        --[[ Quiet, because the button is next to the name it just removed --
+             the panel has already said it more plainly than chat could. ]]--
+        { "Active Scans", "__l_targets", "lines",
+          function() return OB.modules.unitscan:TargetList() end, 200, nil,
+          function(name) OB.modules.unitscan:RemoveTarget(name, true) end },
 
         { "Alerts", "__s_alerts", "section", "alerts" },
         { "Play Alert Sound", "alertSound", "boolean" },
@@ -60,6 +74,9 @@ local M = OB.RegisterModule({
         { "Auto Target", "autoTarget", "boolean" },
         { "Add Marker on Target", "addMarkerOnTarget", "boolean" },
         { "Re-alert Cooldown (Minutes)", "reAlertMinutes", "slider", 1, 10, 1 },
+        { "Stop Re-alerting Found Elites", "stopAfterElite", "boolean" },
+        { "Resume Scanning", "__a_resume", "action",
+          function() OB.modules.unitscan:ResumeScanning() end },
     },
 })
 
@@ -186,6 +203,8 @@ function M:AddTarget(name, quiet)
 
     self.targets[key] = name
     self.seen[key] = nil
+    self.stoppedFor = self.stoppedFor or {}
+    self.stoppedFor[key] = nil
     self.cooldownUntil[key] = nil
     self:WriteTargets()
     self:EnsureRunning()
@@ -212,6 +231,8 @@ function M:RemoveTarget(name, quiet)
 
     self.targets[key] = nil
     self.seen[key] = nil
+    self.stoppedFor = self.stoppedFor or {}
+    self.stoppedFor[key] = nil
     self.cooldownUntil[key] = nil
     self:WriteTargets()
 
@@ -233,6 +254,7 @@ function M:ClearTargets()
     self.targets = {}
     self.targetKeys = {}
     self.seen = {}
+    self.stoppedFor = {}
     self.cooldownUntil = {}
     if EquadisClassicOverhaulDB then EquadisClassicOverhaulDB.unitScanTargets = "" end
     Say("scan list cleared.")
@@ -300,6 +322,22 @@ function M:ToggleTarget(name)
     if OB.RefreshPanel then OB.RefreshPanel() end
 end
 
+--[==[ The names, in the order they are shown everywhere else. Sorted by
+     `ReadTargets`, so this is the same order as the printed list and the same
+     order twice running -- a list that reshuffles itself between refreshes is
+     one nobody can read down. ]==]
+function M:TargetList()
+    self:ReadTargets()
+
+    local out = {}
+
+    for i = 1, table.getn(self.targetKeys) do
+        table.insert(out, self.targets[self.targetKeys[i]])
+    end
+
+    return out
+end
+
 function M:PrintTargets()
     self:ReadTargets()
     if table.getn(self.targetKeys) == 0 then
@@ -339,34 +377,53 @@ function M:RestoreTarget(beforeName, afterName)
     -- legitimately pick the nearest prefix match on 1.12-derived clients.
     if exactName(beforeName, afterName) then return end
 
+    --[[ Silent for the same reason the probe is: putting the player's target
+         back is our doing, not theirs, and it should sound like nothing
+         happened -- which is what did happen. ]]--
     if beforeName then
         if type(TargetLastTarget) == "function" then
-            TargetLastTarget()
+            self:Silently(TargetLastTarget)
         elseif type(TargetByName) == "function" then
             -- Last-resort restoration for custom clients without TargetLastTarget.
-            pcall(TargetByName, beforeName, true)
+            self:Silently(TargetByName, beforeName, true)
         end
     elseif afterName and type(ClearTarget) == "function" then
-        ClearTarget()
+        self:Silently(ClearTarget)
     end
 end
 
-function M:CallTargetAPI(fn, name)
+--[==[ **Silent, which is what "quiet targeting" was supposed to mean.**
+
+     This suppressed the error callback and *not* `PlaySound`, on the reasoning
+     that replacing a global for every probe is unnecessary and could interfere
+     with UI work the target-change event dispatches synchronously.
+
+     The first half is wrong and the second is the reason to be careful rather
+     than a reason not to. A probe is `TargetByName` followed by `ClearTarget`,
+     and both of those are target changes: the client plays its target-acquired
+     sound for one and its target-lost sound for the other. Twice a second, for
+     every name on the watch list, **and only while the player has no target** --
+     `Scan` returns early otherwise. That is the reported ticking, exactly:
+     a noise that starts when you drop target and stops when you take one.
+
+     The suppression is the same shape the unit frames already use around their
+     retarget, and it is restored in the same statement it is needed for, so
+     nothing dispatched after the probe sees a silenced client. ]==]
+function M:Silently(fn, a, b)
     if type(fn) ~= "function" then return false end
 
-    -- Match the vanilla UnitScan technique as narrowly as possible: suppress
-    -- only the UI error callback generated by a failed name lookup.  Earlier
-    -- ECO builds also replaced the global PlaySound function for every probe;
-    -- doing that repeatedly is unnecessary and can interfere with unrelated UI
-    -- work dispatched synchronously by the target-change event.
-    local errors = UIErrorsFrame_OnEvent
+    local sound, errors = PlaySound, UIErrorsFrame_OnEvent
     local quiet = function() end
 
-    UIErrorsFrame_OnEvent = quiet
-    local ok = pcall(fn, name, true)
-    UIErrorsFrame_OnEvent = errors
+    PlaySound, UIErrorsFrame_OnEvent = quiet, quiet
+    local ok = pcall(fn, a, b)
+    PlaySound, UIErrorsFrame_OnEvent = sound, errors
 
     return ok and true or false
+end
+
+function M:CallTargetAPI(fn, name)
+    return self:Silently(fn, name, true)
 end
 
 function M:QuietTarget(name)
@@ -442,7 +499,16 @@ function M:KnownUnitHit()
         if name then
             local key = upper(name)
             local watched = self.targets[key]
-            if watched and self:TargetReady(key, GetTime()) then
+            --[[ **A corpse is not a find.**
+
+                 Standing over the rare you just killed is the single most likely
+                 way to be looking at a watched name, and announcing it there is
+                 both useless and the thing that re-arms a hold the moment it is
+                 released. Skipped rather than alerted. ]]--
+            local dead = type(UnitIsDeadOrGhost) == "function"
+                    and UnitIsDeadOrGhost(units[i]) and true or false
+
+            if watched and not dead and self:TargetReady(key, GetTime()) then
                 self:Found(key, name, false)
                 return true
             end
@@ -482,6 +548,20 @@ function M:EnsureAlert()
     if self.alert then return self.alert end
 
     local f = CreateFrame("Button", "EquadisClassicOverhaulUnitScanAlert", UIParent)
+    --[==[ **Back to the size and the look it had.**
+
+         It was reskinned onto `OB.SkinWindow` -- the panel every other window
+         in this addon wears -- on the reasoning that the popup should read as
+         part of the interface rather than as something a different addon
+         shouted. That reasoning is sound for a window somebody opens and wrong
+         for this one, and the difference is what it is *for*: this appears
+         unannounced, once, in the middle of a pull, and has about a second to
+         be recognised. The tooltip backdrop with an orange edge does not match
+         the rest of the interface, and **not matching is the feature** -- it is
+         the only frame on screen that means "look now".
+
+         So the frame goes back to what it was. What it learned to say stays:
+         how long ago it was found, and the position it was dropped in. ]==]
     f:SetWidth(300)
     f:SetHeight(72)
     f:SetPoint("TOP", UIParent, "TOP", 0, -120)
@@ -492,6 +572,8 @@ function M:EnsureAlert()
     if f.RegisterForClicks then f:RegisterForClicks("LeftButtonUp") end
     f:SetMovable(true)
     f:SetClampedToScreen(true)
+    --[[ The client's tooltip backdrop with an orange edge, which is what this
+         had and what it goes back to. ]]--
     f:SetBackdrop({
         bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -499,9 +581,23 @@ function M:EnsureAlert()
         insets = { left = 4, right = 4, top = 4, bottom = 4 },
     })
     f:SetBackdropColor(0.03, 0.03, 0.03, 0.96)
-    f:SetBackdropBorderColor(0.95, 0.55, 0.08, 1)
+
+    if f.SetBackdropBorderColor then
+        f:SetBackdropBorderColor(0.95, 0.55, 0.08, 1)
+    end
+
     f:Hide()
 
+    --[==[ **No star icon on the frame, and the hint says it in words again.**
+
+         The icon replaced the words on the argument that a raid marker is the
+         same sentence in the space of an icon. It is -- and it cost the frame
+         thirty-eight pixels of its width and pushed every line right, which is
+         most of what made the reskin read as clumsy. The words were never the
+         problem.
+
+         The star still goes on the *mob* when this is clicked; that is
+         `ApplyStarMarker` and is untouched. ]==]
     f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     f.title:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -10)
     f.title:SetText("|cffffd100Unit Found!|r")
@@ -510,6 +606,16 @@ function M:EnsureAlert()
     f.nameText:SetPoint("TOPLEFT", f.title, "BOTTOMLEFT", 0, -4)
     f.nameText:SetPoint("RIGHT", f, "RIGHT", -34, 0)
     f.nameText:SetJustifyH("LEFT")
+
+    --[==[ **How long ago, which the popup knew and never said** -- kept, because
+         it is the one thing the reskin added that was information rather than
+         decoration. A rare that appeared four seconds ago and one that has been
+         on screen for a minute are different situations.
+
+         On the title's line and right-aligned, inboard of the close button, so
+         it takes none of the name's room. ]==]
+    f.since = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    f.since:SetPoint("TOPRIGHT", f, "TOPRIGHT", -30, -12)
 
     f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     f.hint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 8)
@@ -554,11 +660,57 @@ function M:EnsureAlert()
         if f.moving then
             f.moving = nil
             f:StopMovingOrSizing()
+
+            --[[ Where it was dropped, kept. A popup somebody has moved out of
+                 the way of their raid frames moved back to the top of the
+                 screen on the next login, which is the sort of thing that gets
+                 an addon switched off rather than reported. ]]--
+            EquadisClassicOverhaul.modules.unitscan:StoreAlertPosition()
         end
     end)
 
+    self:PlaceAlert(f)
+
     self.alert = f
     return f
+end
+
+--[[ The dropped position, in the profile. Stored as the centre against
+     `UIParent` because that is the one anchor pair the rest of this addon
+     stores and reads -- see the meters. ]]--
+function M:StoreAlertPosition()
+    local f = self.alert
+    if not f or not f.GetCenter then return false end
+
+    local x, y = f:GetCenter()
+    if not x or not y then return false end
+
+    local cfg = self:Config()
+    local scale = UIParent and UIParent.GetEffectiveScale
+            and UIParent:GetEffectiveScale() or 1
+
+    cfg.alertX = x - ((GetScreenWidth() or 0) / 2)
+    cfg.alertY = y - ((GetScreenHeight() or 0) / 2)
+
+    return true
+end
+
+--[[ And put back there when it is built. No stored position means the top of
+     the screen, which is where it has always started. ]]--
+function M:PlaceAlert(f)
+    f = f or self.alert
+    if not f or not f.SetPoint then return false end
+
+    local cfg = self:Config()
+    f:ClearAllPoints()
+
+    if type(cfg.alertX) == "number" and type(cfg.alertY) == "number" then
+        f:SetPoint("CENTER", UIParent, "CENTER", cfg.alertX, cfg.alertY)
+    else
+        f:SetPoint("TOP", UIParent, "TOP", 0, -120)
+    end
+
+    return true
 end
 
 function M:PlayAlertSound(now)
@@ -609,10 +761,39 @@ function M:ShowFoundAlert(name)
     local f = self:EnsureAlert()
     f.foundName = name
     f.nameText:SetText(name)
+    f.foundAt = GetTime()
     f.suppressClick = nil
     f.suppressClickUntil = nil
+
+    self:UpdateAlertAge()
+
     f:Show()
     if f.Raise then f:Raise() end
+end
+
+--[==[ **How long ago it was found, kept current.**
+
+     A popup that says "found" and nothing else is the same sentence at four
+     seconds and at four minutes, and those are different decisions -- the first
+     is worth running for. Written in whole seconds up to a minute and in
+     minutes after that, which is as precise as the answer needs to be.
+
+     Driven from the module's own tick rather than a script of its own: it is
+     one string and the module is already ticking. ]==]
+function M:UpdateAlertAge()
+    local f = self.alert
+    if not f or not f.since or not f.foundAt then return false end
+
+    local age = GetTime() - f.foundAt
+    if age < 0 then age = 0 end
+
+    if age < 60 then
+        f.since:SetText(math.floor(age) .. "s ago")
+    else
+        f.since:SetText(math.floor(age / 60) .. "m ago")
+    end
+
+    return true
 end
 
 function M:ApplyStarMarker()
@@ -634,7 +815,18 @@ function M:Alert(name, isTest)
 
     if not isTest then
         if type(FlashClientIcon) == "function" then FlashClientIcon() end
-        Say("found |cffffd100" .. name .. "|r.")
+        --[[ Say when a name has stopped being scanned for, because otherwise
+             the difference between "muted for two minutes" and "muted until you
+             say otherwise" is invisible, and a scanner that has quietly stopped
+             looking is the thing people file bugs about. ]]--
+        local stopped = self.stoppedFor and self.stoppedFor[upper(name)]
+
+        if stopped then
+            Say("found |cffffd100" .. name .. "|r (" .. stopped .. ") -- quiet "
+                    .. "until this one is gone.")
+        else
+            Say("found |cffffd100" .. name .. "|r.")
+        end
     end
 end
 
@@ -653,7 +845,7 @@ function M:Found(key, name, fromProbe)
     -- immediately clear only targets created by our probe; never clear a unit
     -- the player selected themselves.
     if fromProbe and not cfg.autoTarget and exactName(self:CurrentTargetName(), name) then
-        if type(ClearTarget) == "function" then ClearTarget() end
+        if type(ClearTarget) == "function" then self:Silently(ClearTarget) end
     elseif cfg.autoTarget and not exactName(self:CurrentTargetName(), name) then
         self:QuietTarget(name)
     end
@@ -667,21 +859,159 @@ function M:Found(key, name, fromProbe)
         self:ApplyStarMarker()
     end
 
-    -- Keep watched names registered. A discovery only mutes that specific name
-    -- for a short window; after the cooldown it automatically becomes eligible
-    -- again. This preserves rare-mob usage while also supporting creatures with
-    -- ten-minute-ish respawns such as Devilsaurs.
+    --[[ **A special unit you have already found goes quiet until it is gone.**
+
+         The plain cooldown mutes a discovery for a few minutes and then re-arms
+         itself, which means the rare you just killed is announced again every
+         couple of minutes for the rest of the session.
+
+         Muting the *name* for good fixes that and breaks something worse.
+         There are no GUIDs on 1.12, so a name is all there is -- and Un'Goro has
+         several Devilsaurs. Stop on the name and the second one is silent, which
+         is the exact case the repeating alert existed to serve.
+
+         So the name is held only while that unit is still there. Every probe
+         that finds it keeps the hold; the first probe that does not -- it died,
+         it despawned, you walked away -- releases it, and the next Devilsaur
+         alerts normally. Same probe, same cost as before.
+
+         "Special" is anything the game does not call `normal`. A plain mob
+         sharing the name never starts a hold, because that one was not what you
+         were looking for. ]]--
     self.seen = self.seen or {}
     self.cooldownUntil = self.cooldownUntil or {}
     self.seen[key] = true
-    self.cooldownUntil[key] = GetTime() + self:ReAlertSeconds()
+
+    local classification = self:FoundClassification(name)
+
+    if self:StopsRescanning(classification) then
+        --[[ No cooldown recorded, which is what holds it: `TargetReady` only
+             re-arms a name whose cooldown expired, so a `seen` name with no
+             cooldown stays quiet until something clears it. `Scan` is what
+             clears it, once the unit stops answering. ]]--
+        self.cooldownUntil[key] = nil
+        self.stoppedFor = self.stoppedFor or {}
+        self.stoppedFor[key] = classification or "elite"
+    else
+        self.cooldownUntil[key] = GetTime() + self:ReAlertSeconds()
+    end
 
     self:Alert(name, false)
+end
+
+--[[ Whether this name is being held quiet because the unit it named is still
+     standing there. ]]--
+function M:Holding(key)
+    if not self.stoppedFor then return false end
+    return self.stoppedFor[key] and true or false
+end
+
+--[[ Puts one held name back in the rotation. Called when the unit stops
+     answering probes, which is the addon's only available proof that the thing
+     you found is no longer the thing in front of you. ]]--
+function M:ReleaseHold(key)
+    if self.stoppedFor then self.stoppedFor[key] = nil end
+    if self.seen then self.seen[key] = nil end
+    if self.cooldownUntil then self.cooldownUntil[key] = nil end
+end
+
+--[[ **Is the held unit still there?**
+
+     A corpse still answers a name probe on 1.12, so a dead one counts as gone.
+     Otherwise killing the rare would hold the name until the body despawned --
+     and the whole point of releasing is that the *next* one should alert. ]]--
+--[[ **A held unit you killed while it was still selected.**
+
+     `Scan` refuses to run name probes while the player has a target -- it must,
+     or it would steal the selection -- so the probe that would notice a held
+     unit had died never runs while its corpse is the thing you are looking at.
+     You kill the rare, keep it targeted, and the name stays held.
+
+     Reading target and mouseover costs nothing and needs no probe, so it is
+     checked every tick before that early return. ]]--
+function M:ReleaseDeadHolds()
+    if not self.stoppedFor then return false end
+    if type(UnitName) ~= "function" then return false end
+    if type(UnitIsDeadOrGhost) ~= "function" then return false end
+
+    local released = false
+    local units = { "target", "mouseover" }
+
+    for i = 1, table.getn(units) do
+        local name = UnitName(units[i])
+
+        if name then
+            local key = upper(name)
+
+            if self:Holding(key) and UnitIsDeadOrGhost(units[i]) then
+                self:ReleaseHold(key)
+                released = true
+            end
+        end
+    end
+
+    return released
+end
+
+function M:HeldUnitPresent(name)
+    if not self:QuietTarget(name) then return false end
+
+    if type(UnitIsDeadOrGhost) == "function" and UnitIsDeadOrGhost("target") then
+        return false
+    end
+
+    return true
+end
+
+--[[ What the unit we just matched actually is. Read before anything clears the
+     probe's target, because `Found` clears it a few lines later and a cleared
+     target has no classification. ]]--
+function M:FoundClassification(name)
+    if type(UnitClassification) ~= "function" then return nil end
+    if type(UnitName) ~= "function" then return nil end
+
+    local units = { "target", "mouseover" }
+
+    for i = 1, table.getn(units) do
+        if exactName(UnitName(units[i]), name) then
+            return UnitClassification(units[i])
+        end
+    end
+
+    return nil
+end
+
+--[[ Anything the game does not call `normal`. An unknown classification -- a
+     client that does not answer, a unit already gone -- is treated as normal,
+     so the failure mode is the old behaviour rather than a scanner that
+     silently stopped. ]]--
+function M:StopsRescanning(classification)
+    if not self:Config().stopAfterElite then return false end
+    if not classification or classification == "" then return false end
+
+    return classification ~= "normal"
+end
+
+--[[ Puts every stopped name back in the rotation. The list itself is untouched
+     -- this is the counterpart to a discovery sticking, not a way to clear
+     targets. ]]--
+function M:ResumeScanning()
+    self.seen = {}
+    self.stoppedFor = {}
+    self.cooldownUntil = {}
+
+    self:EnsureRunning()
+    Say("scanning again for every name on the list.")
+
+    return true
 end
 
 function M:Scan(now)
     if not self.targetKeys then self:ReadTargets() end
     if table.getn(self.targetKeys) == 0 then return end
+
+    -- Cheap, needs no probe, and must happen before the early return below.
+    self:ReleaseDeadHolds()
 
     -- First trust actual unit tokens.  This catches a watched unit the player
     -- targets or hovers even on servers with a broken exact-name search API.
@@ -713,6 +1043,35 @@ function M:Scan(now)
         local key = self.targetKeys[i]
         local name = self.targets[key]
 
+        --[[ **A held name is still probed -- just never announced.**
+
+             This is what makes the hold track the unit rather than the name. It
+             is the same probe the name would get anyway, so a held target costs
+             what it always cost; the only difference is that finding it says
+             nothing and failing to find it re-arms the name.
+
+             Checked before the ready branch because a held name is never
+             "ready" -- `TargetReady` is exactly what the hold suppresses. ]]--
+        if name and self:Holding(key) then
+            local present = self:HeldUnitPresent(name)
+
+            --[[ Never leave a probe's target selected. The player had no target
+                 when this ran -- `Scan` returns early otherwise -- so anything
+                 selected now was selected by us. ]]--
+            if exactName(self:CurrentTargetName(), name) then
+                if type(ClearTarget) == "function" then self:Silently(ClearTarget) end
+            end
+
+            --[[ Returning only when it is still there. Releasing and carrying
+                 on matters: hold one name, return on its miss every tick, and
+                 every other name on the list is never probed again. ]]--
+            if not present then
+                self:ReleaseHold(key)
+            else
+                return
+            end
+        end
+
         -- A watched name is probed only when its per-target cooldown has
         -- expired. This prevents repeated Auto Target / sound / popup spam.
         if name and self:TargetReady(key, GetTime()) then
@@ -730,6 +1089,10 @@ end
 
 function M:OnUpdate(now)
     self:UpdateFlash(now)
+
+    --[[ The "found 12s ago" line, while the popup is up. One string, on a
+        module that is already ticking. ]]--
+    if self.alert and self.alert:IsShown() then self:UpdateAlertAge() end
 
     if not self.lastCheck or now - self.lastCheck >= CHECK_INTERVAL then
         self.lastCheck = now
@@ -758,11 +1121,13 @@ function M:OnUnbind()
     if self.alert then self.alert:Hide() end
 end
 
--- Keep the familiar upstream command while the settings page remains the main
--- way to maintain the list. The second spelling avoids a collision while the
--- standalone unitscan addon is still installed during migration/testing.
-SLASH_EQOUNITSCAN1 = "/unitscan"
-SLASH_EQOUNITSCAN2 = "/equnitscan"
+--[[ `/us` first, because it is the one worth typing. The longer spellings stay
+     registered: `/unitscan` is what the standalone addon used and what a decade
+     of habit reaches for, and `/equnitscan` avoids the collision while that
+     addon is still installed alongside this one. ]]--
+SLASH_EQOUNITSCAN1 = "/us"
+SLASH_EQOUNITSCAN2 = "/unitscan"
+SLASH_EQOUNITSCAN3 = "/equnitscan"
 SlashCmdList.EQOUNITSCAN = function(parameter)
     local name = trim(parameter)
     if name == "" then

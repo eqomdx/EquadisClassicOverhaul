@@ -158,6 +158,10 @@ local M = OB.RegisterModule({
         "PLAYER_TARGET_CHANGED",
         "WHO_LIST_UPDATE",
 
+        --[[ A `/who` somebody typed prints to chat and fires nothing else.
+             See `LearnWhoLine`. ]]--
+        "CHAT_MSG_SYSTEM",
+
         "CHAT_MSG_SAY",
         "CHAT_MSG_YELL",
         "CHAT_MSG_EMOTE",
@@ -187,7 +191,28 @@ end
      remember between sessions. ]]--
 OB.subgroups = {}
 
-function M:Learn(name, class, level, subgroup)
+--[==[ **How long a level stays believed against a lower answer.**
+
+     The thing the ratchet below exists to stop is the server's own `/who`
+     cache: ask twice in quick succession and the second answer can be older
+     than the first. That echo comes back within one query round trip, so a
+     minute is a long time next to it -- and no time at all next to a sweep,
+     which takes twenty. ]==]
+local LEVEL_TRUST = 60
+
+--[==[ **When each level in the database was last written, this session only.**
+
+     Deliberately not saved. A timestamp per player would roughly double the
+     size of a swept realm's roster on disk to answer a question that only
+     matters while the client is running -- and the answer it needs on a fresh
+     login is "not yet", which an empty table gives for free.
+
+     Keyed by name beside the roster rather than stored in it, for the same
+     reason `OB.subgroups` is: it is true for this session and misleading the
+     moment the session ends. ]==]
+local levelSeen = {}
+
+function M:Learn(name, class, level, subgroup, guild)
     if not name or name == "" then return end
 
     local known = OB.roster[name]
@@ -210,11 +235,58 @@ function M:Learn(name, class, level, subgroup)
         known.class = OB.ClassToken(class) or known.class
     end
 
-    --[[ Levels only ever go up, and a lower one is stale rather than new: `/who`
-         answers from a cache the server does not always refresh, so a level 48
-         arriving after a level 52 is the past catching up. Prat had this. ]]--
-    if level and level > 0 and (not known.level or level > known.level) then
-        known.level = level
+    --[==[ **A level goes up on its own. It comes down when the answer is
+         newer than the one already stored.**
+
+         The rule here was "levels only ever go up", and the reasoning was sound
+         as far as it went: `/who` answers from a cache the server does not
+         always refresh, so a level 48 arriving seconds after a level 52 is the
+         past catching up rather than somebody losing a level. Prat had this.
+
+         What it missed is that this database outlives the session. A number
+         that got in too high could never be corrected -- not by a `/who`, not
+         by a sweep, not by standing next to the person. Reported as exactly
+         that: a player scanned once, scanned again, and the level never moves.
+
+         Plenty of things can put a wrong number in. A name freed by a deleted
+         character and taken by a new one. A roster read while the client was
+         still filling it in. A realm swept a month ago. A permanent ratchet
+         turns any of those into a permanent wrong answer -- which is worse than
+         the stale answer it was guarding against, because the stale one fixes
+         itself on the next query and this one never does.
+
+         So the guard keeps its job and loses its permanence. An answer arriving
+         while the stored one is still warm cannot lower it; an answer arriving
+         after that is simply the newer fact. The first answer of a session is
+         always newer, because whatever is on disk was learned before it.
+
+         Without a clock this falls back to the old rule rather than to
+         overwriting: something that cannot tell when it learned a fact should
+         not be given permission to forget it. ]==]
+    if level and level > 0 then
+        local now = (type(time) == "function" and time()) or 0
+        local at = levelSeen[name]
+
+        local newer = (at == nil) or (now > 0 and (now - at) >= LEVEL_TRUST)
+
+        if not known.level or level > known.level or newer then
+            known.level = level
+            levelSeen[name] = now
+        end
+    end
+
+    --[==[ **The guild kept, because it was already being answered and thrown
+         away.**
+
+         `GetWhoInfo` has returned it second since the beginning and the guild
+         roster knows it by definition. The only reason a nameplate could not
+         show a guild was that nobody wrote the answer down.
+
+         An empty string is cleared rather than ignored. That is the client
+         saying "none", and reading it as "no news" would leave somebody who had
+         just left a guild still wearing it for the rest of the session. ]==]
+    if guild ~= nil then
+        if guild == "" then known.guild = nil else known.guild = guild end
     end
 
     if subgroup then OB.subgroups[name] = subgroup end
@@ -298,7 +370,11 @@ end
 function M:LearnGuild()
     for i = 1, GetNumGuildMembers() do
         local name, _, _, level, class = GetGuildRosterInfo(i)
-        self:Learn(name, class, level)
+
+        -- Everybody in this list is in this guild -- that is what makes it this
+        -- list -- so the row does not repeat the guild's name and the player's
+        -- own guild is the right answer for all of them.
+        self:Learn(name, class, level, nil, GetGuildInfo("player"))
     end
 end
 
@@ -332,9 +408,91 @@ function M:LearnTarget()
     self:Learn(UnitName("target"), class, UnitLevel("target"))
 end
 
---[[ The one reader that is also the scanner's answer. It does not care which of
-     the two asked -- a `/who` result is a `/who` result, whether you typed it or
-     the queue did. ]]--
+--[==[ **A `/who` you typed yourself, which the structured reader never sees.**
+
+     `LearnWho` below reads `GetWhoInfo`, and that is empty unless the answer
+     was routed to the UI. A `/who` typed by hand is not: it goes to the chat
+     frame as printed text, `WHO_LIST_UPDATE` does not fire, and the note at the
+     top of `NoWhoWindow` says so in as many words. The consequence went
+     unnoticed because the comment on `LearnWho` claims the opposite -- "a
+     `/who` result is a `/who` result, whether you typed it or the queue did" --
+     and that is true of the two callers it knew about and false of this one.
+
+     Reported as a level that would not update: somebody seen at 47, looked up
+     by hand, shown as 60 in the chat frame, and still 47 in every prefix
+     afterwards.
+
+     **The pattern is built from the client's own format string** rather than
+     written out here, which is what makes this safe to do at all. The
+     objection to parsing chat was that it means reading sentences in whatever
+     language the client is running in -- and it would, if the sentence were
+     spelled here. `WHO_LIST_FORMAT` *is* that sentence, in that language, as
+     the client itself assembled it, so turning it into a pattern is reading
+     the client's answer rather than guessing at it.
+
+     **Only the name and the level.** The format runs `Level %d %s %s`, race
+     then class, and a race can be two words -- High Elf, Night Elf. Lazy
+     captures would hand back a race of "High" and a class of "Elf Warrior",
+     which is worse than no class at all because it would be stored. The level
+     is the thing that was wrong and the level is what this takes. ]==]
+local whoLinePatterns
+
+local function buildWhoPatterns()
+    if whoLinePatterns then return whoLinePatterns end
+
+    whoLinePatterns = {}
+
+    for _, name in ipairs({ "WHO_LIST_GUILD_FORMAT", "WHO_LIST_FORMAT" }) do
+        local format = getglobal(name)
+
+        if type(format) == "string" then
+            --[[ Everything up to and including the level, and nothing after
+                 it: the tail is where the ambiguity lives. ]]--
+            local cut = string.find(format, "%%d")
+
+            if cut then
+                local head = string.sub(format, 1, cut + 1)
+
+                local pattern = string.gsub(head,
+                        "([%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+                pattern = string.gsub(pattern, "%%d", "(%%d+)")
+                pattern = string.gsub(pattern, "%%s", "(.-)")
+
+                table.insert(whoLinePatterns, "^" .. pattern)
+            end
+        end
+    end
+
+    return whoLinePatterns
+end
+
+function M:LearnWhoLine(line)
+    if type(line) ~= "string" or line == "" then return false end
+
+    local patterns = buildWhoPatterns()
+
+    for i = 1, table.getn(patterns) do
+        local _, _, name, shown, level = string.find(line, patterns[i])
+
+        --[[ The format names the player twice -- once inside the link and once
+             as the text of it. The link half is the one without colour codes
+             or brackets, so it is the one worth keeping. ]]--
+        name = name or shown
+        level = tonumber(level)
+
+        if name and name ~= "" and level and level > 0 then
+            self:Learn(name, nil, level)
+            return true
+        end
+    end
+
+    return false
+end
+
+--[[ The structured reader, for answers routed to the UI. A `/who` typed by
+     hand does not come this way at all -- it prints to chat and is picked up by
+     `LearnWhoLine`. This used to claim it did not care which of the two asked,
+     which was the reason nobody noticed that one of them was never read. ]]--
 function M:LearnWho()
     --[[ GetNumWhoResults returns both the number of rows the client received and
          the total number of players that matched the query. The first number is
@@ -343,8 +501,8 @@ function M:LearnWho()
     local count, totalCount = GetNumWhoResults()
 
     for i = 1, count do
-        local name, _, level, _, class = GetWhoInfo(i)
-        self:Learn(name, class, level)
+        local name, guild, level, _, class = GetWhoInfo(i)
+        self:Learn(name, class, level, nil, guild)
     end
 
     return count, totalCount or count
@@ -572,6 +730,133 @@ function M:StartLevelScan(level)
     return self.scanTotal
 end
 
+
+--[[ **A range of levels, one query per level.**
+
+     `/who 50-60` is a single query and answers at most fifty players, which on
+     any realm with people on it is an overflow -- the eleven levels come back as
+     whichever fifty the server felt like. One query per level is eleven queries
+     that each answer completely.
+
+     The sweep's own splitting handles the rest: a level that still overflows
+     gets cut by class exactly as it does in a full scan, because these are the
+     same band entries the full sweep queues. ]]--
+function M:StartRangeScan(low, high)
+    low, high = tonumber(low), tonumber(high)
+    if not low or not high then return 0 end
+
+    --[[ Written either way round, because somebody typing a range has no reason
+         to know which end this expects. ]]--
+    if low > high then low, high = high, low end
+
+    if low < 1 then low = 1 end
+    if high > MAX_LEVEL then high = MAX_LEVEL end
+    if low > high then return 0 end
+
+    self.queue = {}
+    self.scanTotal = 0
+    self.backoff = 0
+
+    for level = low, high do
+        table.insert(self.queue, {
+            kind = "band", low = level, high = level,
+            query = tostring(level),
+            label = "level " .. level .. " players",
+        })
+    end
+
+    self.scanTotal = table.getn(self.queue)
+    self.scanDone = 0
+    self.sweepAdded = 0
+
+    return self.scanTotal
+end
+
+--[[ **One class, every level, in bands of ten.**
+
+     `/who c-"Mage"` on its own is one query and every mage on the realm, which
+     is an overflow on the first attempt. Bands of ten are what fit: a band that
+     still comes back full is split by the sweep's own rule, down to single
+     levels, and a single level of one class is as narrow as `/who` goes.
+
+     Six queries rather than sixty, which is the point -- somebody asking about
+     one class is asking a narrower question than the full sweep and should wait
+     a tenth as long for it. ]]--
+local CLASS_BAND = 10
+
+function M:StartClassScan(class)
+    if type(class) ~= "string" or class == "" then return 0 end
+
+    self.queue = {}
+    self.scanTotal = 0
+    self.backoff = 0
+
+    local low = 1
+    while low <= MAX_LEVEL do
+        local high = low + CLASS_BAND - 1
+        if high > MAX_LEVEL then high = MAX_LEVEL end
+
+        table.insert(self.queue, {
+            kind = "band",
+            low = low, high = high,
+
+            --[[ `byClass` is deliberately *not* set. It marks a band that has
+                 already been cut by class and therefore cannot be cut again --
+                 and these have not been cut, they were asked that way. Setting
+                 it would stop a band of ten mages splitting into single levels
+                 when it overflows, which is exactly when it needs to. ]]--
+            query = low .. "-" .. high .. ' c-"' .. class .. '"',
+            label = "levels " .. low .. "-" .. high .. " " .. class .. "s",
+        })
+
+        low = high + 1
+    end
+
+    self.scanTotal = table.getn(self.queue)
+    self.scanDone = 0
+    self.sweepAdded = 0
+
+    return self.scanTotal
+end
+
+--[[ The class this addon knows by that name, whatever case it was typed in.
+
+     Matched against what the roster has actually seen rather than a list of
+     nine, because the server's own spelling is the one `/who` wants back -- and
+     on a realm this addon has never swept there is nothing to match, which is
+     an honest "no" rather than a query that returns nothing. ]]--
+function M:ClassNamed(text)
+    if type(text) ~= "string" or text == "" then return nil end
+
+    local wanted = string.lower(text)
+
+    local names = self:ClassNames()
+    for i = 1, table.getn(names) do
+        if string.lower(names[i]) == wanted then return names[i] end
+    end
+
+    --[[ **Falls back to the nine this addon knows**, so a fresh install can ask
+         about a class nobody has been seen playing yet -- which is every class,
+         on a realm that has never been swept.
+
+         `OB.ClassToken` is the same name-to-token map the colours use, and it
+         is honest about locale: on a client this addon has no table for it
+         answers nil, and the command says it does not know that class rather
+         than sending `/who c-"Магистр"` and getting nothing back. ]]--
+    if OB.ClassToken then
+        local token = OB.ClassToken(text)
+
+        if token and OB.classColors and OB.classColors[token] then
+            --[[ Title case, which is the spelling `/who` wants: the server
+                 answers "Mage" and matches on it, where "MAGE" matches
+                 nothing. ]]--
+            return string.upper(string.sub(token, 1, 1))
+                    .. string.lower(string.sub(token, 2))
+        end
+    end
+
+    return nil
+end
 --[[ **Sixty queries, one level at a time, and class only where it is needed.**
 
      There were three shapes on a dropdown -- level, level-and-class, and zone --
@@ -617,17 +902,13 @@ function M:ScanProgress()
     return (self.scanDone or 0) .. " of " .. (self.scanTotal or 0)
 end
 
---[[ Anything at all is queued or outstanding -- a name lookup counts. ]]--
-function M:Scanning()
-    return table.getn(self.queue or {}) > 0
-end
+--[[ **A full sweep is running**, as opposed to anything being queued at all.
 
---[[ **A full sweep is running**, which is a different question.
-
-     A name lookup puts an item on the same queue, so `Scanning` is true whenever
-     anything is pending at all. Only a sweep sets `scanTotal`, and the sweep is
+     A name lookup puts an item on the same queue, so "is the queue busy" is true
+     far more often than this is. Only a sweep sets `scanTotal`, and the sweep is
      what the button stops, what the progress counts, and what holds the
-     automatic lookups back. ]]--
+     automatic lookups back -- which is why this is the question every caller
+     turned out to want. ]]--
 function M:Sweeping()
     return self.scanTotal ~= nil
 end
@@ -729,6 +1010,26 @@ function M:SetScanning(on, level)
     return true
 end
 
+--[[ **Everything `SetScanning` does around building a queue, for the callers
+     that build their own.**
+
+     A range and a class scan queue themselves -- they are not one level and not
+     the full sixty -- but the bookkeeping either side is identical: querying has
+     to be switched on, the automatic scan has to stand aside, and somebody has
+     to be told it started. Factored out rather than repeated three times,
+     because three copies of "and also turn querying on" is two chances to
+     forget it. ]]--
+function M:BeginQueuedScan(what)
+    if not self.queue or table.getn(self.queue) == 0 then return false end
+
+    self:Config().scan = true
+
+    Say("Scan started for " .. (what or "players") .. "...")
+    self:HoldAutoScan()
+
+    return true
+end
+
 
 --[[ **Every class spelling the roster has actually seen, deduplicated without
      regard to case.**
@@ -810,11 +1111,31 @@ function M:MutePanel()
 
     local mine = OB.modules.roster
 
-    self.showPanel = ShowUIPanel
+    --[[ **The wrapper holds the original itself rather than reading it back off
+         the module.**
+
+         It used to call `mine.showPanel(...)`, and `UnmutePanel` clears that
+         field -- while deliberately leaving the wrapper installed if somebody
+         else has wrapped over the top of it since, because deleting another
+         addon's hook is worse than leaving one of ours behind.
+
+         Those two are the bug. DragonflightUI wraps `ShowUIPanel` as well, so
+         after a sweep ended, ECO's wrapper was still in the chain with nothing
+         behind it: the next thing to open a panel -- the bank -- called through
+         it and hit `attempt to call field 'showPanel' (a nil value)`.
+
+         An upvalue cannot be cleared from outside, so the wrapper can always
+         reach the function it wrapped. Whether it *suppresses* is a separate
+         question, and that is what the flag below answers -- so an orphaned
+         wrapper quietly becomes a pass-through instead of a crash. ]]--
+    local original = ShowUIPanel
+
+    self.showPanel = original
+    self.panelMuted = true
 
     ShowUIPanel = function(frame, force)
-        if frame and frame == FriendsFrame then return end
-        return mine.showPanel(frame, force)
+        if mine.panelMuted and frame and frame == FriendsFrame then return end
+        return original(frame, force)
     end
 
     self.showMine = ShowUIPanel
@@ -828,6 +1149,11 @@ end
      of ours in place. ]]--
 function M:UnmutePanel()
     if not self.showPanel then return false end
+
+    --[[ Muting stops first and unconditionally. Whether the wrapper can be
+         taken back out is a second question -- and if it cannot, this is what
+         makes the one left behind harmless. ]]--
+    self.panelMuted = nil
 
     if ShowUIPanel == self.showMine then ShowUIPanel = self.showPanel end
 
@@ -1112,6 +1438,14 @@ local LEARNERS = {
 function M:OnEvent()
     if event == "WHO_LIST_UPDATE" then
         self:OnWhoResults()
+        return
+    end
+
+    --[[ Answered before the `CHAT_MSG_` sweep below, which this event's name
+         would otherwise fall into -- `arg2` on a system message is not a
+         player and asking about it would queue a query for nobody. ]]--
+    if event == "CHAT_MSG_SYSTEM" then
+        self:LearnWhoLine(arg1)
         return
     end
 

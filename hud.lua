@@ -12,8 +12,6 @@
 
 local OB = EquadisClassicOverhaul
 
-local floor = math.floor
-
 -- replaced by options.lua once the panel exists
 function OB.RefreshPanel() end
 
@@ -118,9 +116,51 @@ function OB.HideFeature(m)
     end
 end
 
+--[[ **One broken feature must not unbind the rest of the addon.**
+
+     `BindSlots()` used to call every module's `OnBind` directly. A single Lua
+     error therefore aborted the whole binding pass at that exact module: every
+     bar/feature later in module order simply never registered its events or
+     created its frame. From the outside that looks like unrelated systems were
+     deleted together -- Threat Meter, Damage Meter, Map, OmniBars, and so on.
+
+     Bind each module in isolation, report the failing subsystem, and keep going.
+     Successful modules behave exactly as before; only the failure path changes. ]]--
+local function safeModuleCall(m, method, a1)
+    local fn = m and m[method]
+    if not fn then return true end
+
+    local ok, err
+    if a1 ~= nil then
+        ok, err = pcall(fn, m, a1)
+    else
+        ok, err = pcall(fn, m)
+    end
+
+    if ok then
+        m.bindFault = nil
+        return true
+    end
+
+    m.bindFault = tostring(err)
+    if OB.Print then
+        OB.Print("|cffff5511" .. (m.name or m.id or "module")
+                .. " " .. method .. " failed: " .. tostring(err) .. "|r")
+    end
+    return false
+end
+
+local function registerModuleEvents(m)
+    for e = 1, table.getn(m.events) do
+        local ev = m.events[e]
+        OB.eventMap[ev] = OB.eventMap[ev] or {}
+        table.insert(OB.eventMap[ev], m)
+    end
+end
+
 local function unbindFeatures()
     for id, m in pairs(OB.features) do
-        if m.OnUnbind then m:OnUnbind() end
+        safeModuleCall(m, "OnUnbind")
         OB.HideFeature(m)
         OB.features[id] = nil
     end
@@ -132,26 +172,24 @@ local function bindFeatures()
         local m = OB.modules[id]
 
         if m.feature and OB.ModuleEnabled(id) then
-            OB.features[id] = m
-
-            for e = 1, table.getn(m.events) do
-                local ev = m.events[e]
-                OB.eventMap[ev] = OB.eventMap[ev] or {}
-                table.insert(OB.eventMap[ev], m)
+            -- Build first. Only a feature that successfully bound is allowed
+            -- into the live event/tick maps; a half-created feature otherwise
+            -- turns one startup fault into repeated event faults afterwards.
+            if safeModuleCall(m, "OnBind") then
+                OB.features[id] = m
+                registerModuleEvents(m)
+                m.needsDraw = true
+            else
+                OB.HideFeature(m)
+                OB.features[id] = nil
             end
-
-            --[[ A feature builds its own frame in OnBind, and is passed no slot
-                 to build it against. Nothing here creates one for it: a window
-                 is not a bar and the two have no geometry in common. ]]--
-            if m.OnBind then m:OnBind() end
-            m.needsDraw = true
         end
     end
 end
 
 function OB.BindSlots()
     for slotId, m in pairs(OB.bound) do
-        if m.OnUnbind then m:OnUnbind() end
+        safeModuleCall(m, "OnUnbind")
         if m.frame then m.frame:Hide() end
         m.slotId = nil
         OB.bound[slotId] = nil
@@ -198,14 +236,14 @@ function OB.BindSlots()
 
             OB.bound[slotId] = m
 
-            for e = 1, table.getn(m.events) do
-                local ev = m.events[e]
-                OB.eventMap[ev] = OB.eventMap[ev] or {}
-                table.insert(OB.eventMap[ev], m)
+            if safeModuleCall(m, "OnBind", slot) then
+                registerModuleEvents(m)
+                m.needsDraw = true
+            else
+                if m.frame then m.frame:Hide() end
+                OB.bound[slotId] = nil
+                m.slotId = nil
             end
-
-            if m.OnBind then m:OnBind(slot) end
-            m.needsDraw = true
         end
     end
 
@@ -219,8 +257,44 @@ function OB.BindSlots()
         OB.events:RegisterEvent(OB.coreEvents[i])
     end
 
+    OB.RebuildTickables()
+
     OB.hud.needsDraw = true
 end
+
+--[[ **The modules that can tick, as a flat list.**
+
+     The single OnUpdate used to walk `OB.bound` and `OB.features` with `pairs`
+     every frame to find the few modules that animate. Most modules have no
+     `OnUpdate` at all and can never tick, so the great majority of that walk
+     answered "no" about the same modules a hundred and fifty times a second.
+
+     pfDebug put `EquadisClassicOverhaulHUD:OnUpdate` second across every addon
+     loaded, and this was the part of it that runs whether or not anything is
+     animating. `/eq perf` never saw it: it wraps module methods, and this is
+     the frame script that calls them.
+
+     **`tickly` is still read per frame**, because modules flip it themselves at
+     runtime -- the tooltip turns itself on for a fade and off again afterwards.
+     What is precomputed is only which modules could ever tick, which changes
+     when binding changes and not otherwise. ]]--
+function OB.RebuildTickables()
+    local list = {}
+
+    for slotId, m in pairs(OB.bound) do
+        if m.OnUpdate then table.insert(list, m) end
+    end
+
+    for id, m in pairs(OB.features) do
+        if m.OnUpdate then table.insert(list, m) end
+    end
+
+    OB.tickables = list
+
+    return list
+end
+
+OB.tickables = {}
 
 -- ---------------------------------------------------------------------------
 -- refresh
@@ -263,9 +337,10 @@ function OB.Refresh(force)
         OB.UpdateMoveControls()
     end
 
+    OB.RebuildTickables()
+
     OB.hud.needsDraw = true
     OB.Toggle()
-    OB.Fire("refresh")
 end
 
 --[[ Show or hide the whole HUD.
@@ -438,6 +513,16 @@ coreHandlers.PLAYER_ENTERING_WORLD = function()
     OB.inCombat = UnitAffectingCombat("player") and true or false
     OB.inStealth = OB.IsStealthed()
     OB.Refresh(true)
+
+    --[[ Said here rather than at VARIABLES_LOADED: every addon has finished
+         loading by now, so `IsAddOnLoaded` gives a complete answer. ]]--
+    if OB.WarnConflicts then OB.WarnConflicts() end
+
+    --[[ And the walkthrough, for an account that has never seen it. Here for
+         the same reason the conflict warning is: the world is drawn, so a
+         window that opens now is a window somebody actually sees rather than
+         one that appears over a loading screen and gets dismissed. ]]--
+    if OB.MaybeShowSetup then OB.MaybeShowSetup() end
 end
 
 coreHandlers.PLAYER_REGEN_DISABLED = function()
@@ -492,6 +577,15 @@ OB.hud:SetScript("OnUpdate", function()
 
     OB.UpdateDrag()
 
+    --[[ And the camera, if a press on one of this addon's frames has turned
+         into a drag. See `OB.StepCameraDrag`. ]]--
+    if OB.StepCameraDrag then OB.StepCameraDrag() end
+
+    --[[ Control, Shift and Alt together unlock everything. Polled because 1.12
+         has no modifier event -- it is three cheap client calls, and only on a
+         change does anything happen. See `OB.CheckEditHotkey`. ]]--
+    if OB.CheckEditHotkey then OB.CheckEditHotkey() end
+
     if OB.testMode then
         for slotId, m in pairs(OB.bound) do
             if m.TestStep then m:TestStep(now) end
@@ -501,12 +595,16 @@ OB.hud:SetScript("OnUpdate", function()
         end
     end
 
-    -- modules that animate continuously: a sweeping swing bar, a ticker spark
-    for slotId, m in pairs(OB.bound) do
-        if m.tickly and m.OnUpdate then m:OnUpdate(now) end
-    end
-    for id, m in pairs(OB.features) do
-        if m.tickly and m.OnUpdate then m:OnUpdate(now) end
+    --[[ Modules that animate continuously: a sweeping swing bar, a ticker
+         spark. Walked as a flat list of the ones that *could* tick rather than
+         with `pairs` over every bound module and every feature -- see
+         `OB.RebuildTickables`. Most modules have no OnUpdate at all, and this
+         runs a hundred and fifty times a second. ]]--
+    local ticking = OB.tickables
+
+    for i = 1, table.getn(ticking) do
+        local m = ticking[i]
+        if m.tickly then m:OnUpdate(now) end
     end
 
     if this.needsDraw then

@@ -7,7 +7,7 @@
     in range     the equipped ranged weapon can reach the target
     too close    inside its minimum range -- the hunter dead zone
     too far      past its maximum
-    no line of sight  something is in the way (opt in)
+    no line of sight  something is in the way
     no target    nothing selected
 
   The question is deliberately about the *equipped weapon* rather than some
@@ -34,10 +34,11 @@
 
   One warning for whoever reads this next. **Do not treat UnitPosition as an
   exact hostile-distance API.** SuperWoW deliberately exposes coordinates for
-  friendly units only. UnitXP was loaded on this installation when hostile
-  yardage worked, but has since been disabled. Stock Nampower gives the hostile
-  in/out answer; a Nampower build exposing GetUnitDistance supplies the exact
-  hostile number without UnitXP.
+  friendly units only. Stock Nampower gives the hostile in/out answer; a Nampower
+  build exposing GetUnitDistance supplies the exact hostile number, and UnitXP_SP3
+  supplies it for everything -- which is what this installation now has, so the
+  precise backend is the live one here and the ladder below is the fallback it
+  was written to be.
 ]]--
 
 local OB = EquadisClassicOverhaul
@@ -153,24 +154,17 @@ end
      number or nothing; there is no path through it that yields a boolean. A
      boolean back is therefore proof that the dispatcher answered, and it does
      not depend on guessing what SP3 does with input meant for something else. ]]--
-function OB.HasUnitXP()
-    if type(UnitXP) ~= "function" then return false end
+--[==[ **The probe moved to `capabilities.lua`, and this is now its caller.**
 
-    local ok, sight = pcall(UnitXP, "inSight", "player", "player")
-    if ok and type(sight) == "boolean" then return true end
+     Two things were wrong with it living here. It was asked afresh on every
+     distance lookup -- a `pcall` into a dispatcher, per unit, per frame, for an
+     answer that cannot change within a session. And it was one of three places
+     in the addon working out for itself what the client could do, which is the
+     thing the capability layer exists to stop.
 
-    --[[ An SP3 build too old for inSight. Weaker, so it is second and it is
-         guarded: distance from yourself to yourself is exactly zero, and the
-         stock API has to have *failed* to answer its own question first. Without
-         that guard a client whose UnitXP returns 0 for an unknown unit would be
-         read as SP3, and every distance would come back 0 -- a bar stuck on "too
-         close" is worse than one that admits it cannot measure. ]]--
-    local okX, xp = pcall(UnitXP, "player")
-    if okX and type(xp) == "number" then return false end
-
-    local okD, yards = pcall(UnitXP, "distanceBetween", "player", "player")
-    return (okD and type(yards) == "number" and yards == 0) and true or false
-end
+     The reasoning that arrived at the probe is kept with the probe. It is the
+     second version of it and the first one silently disabled the extension on
+     machines that had it. ]]==]--
 
 --[[ A true distance in yards, or nil.
 
@@ -184,7 +178,13 @@ function OB.UnitDistance(unit)
         if ok and type(yards) == "number" and yards >= 0 then return yards end
     end
 
-    if OB.HasUnitXP() then
+    --[==[ Guarded on the function existing, not just on its answer. The
+         capability layer is a file, and a file added since the client last
+         started is not loaded -- the game reads an addon's list once at startup,
+         so a `/reload` re-runs the old list. Without this the range module stops
+         answering at all rather than falling back to the vanilla behaviour it
+         was written to fall back to. ]==]
+    if OB.HasUnitXP and OB.HasUnitXP() then
         local ok, yards = pcall(UnitXP, "distanceBetween", "player", unit)
         if ok and type(yards) == "number" and yards >= 0 then return yards end
     end
@@ -255,7 +255,7 @@ function OB.InSight(unit)
          it with "inSight" and two unit tokens. That returned a number, the
          boolean test rejected it, and the whole feature answered "cannot tell"
          forever while looking like it was wired up. ]]--
-    if not OB.HasUnitXP() then return nil end
+    if not OB.HasUnitXP or not OB.HasUnitXP() then return nil end
 
     local ok, sight = pcall(UnitXP, "inSight", "player", unit)
     if not ok or type(sight) ~= "boolean" then return nil end
@@ -341,7 +341,7 @@ end
 -- reaches 40: 0 then 1 puts the target between them. Enough thresholds and the
 -- answer narrows to a band.
 --
--- Three facts from the client make it work, all verified with /eqob rangedebug
+-- Three facts from the client make it work, all verified with /eq rangedebug
 -- rather than assumed, and the whole idea collapses without any of them:
 --
 --   * **Asking by id works for spells you do not know.** By name it fails --
@@ -376,7 +376,7 @@ end
 local LADDER_MAX = 120
 
 --[[ The first eight came from guesswork and happened to be right. The rest came
-     from `/eqob rangescan`, which reads the client's range table directly and
+     from `/eq rangescan`, which reads the client's range table directly and
      names a spell for every band in it -- and found seven bands the guessing had
      missed, including the 25 and the 45 that were the two worst gaps.
 
@@ -406,7 +406,7 @@ local LADDER_IDS = {
     530,    -- Charm (Possess), 60
 }
 
--- exposed so /eqob rangedebug probes the real list rather than a copy of it that
+-- exposed so /eq rangedebug probes the real list rather than a copy of it that
 -- can drift out of step with this one
 OB.ladderCandidates = LADDER_IDS
 
@@ -691,11 +691,21 @@ local M = OB.RegisterModule({
              they want. ]]--
         losWindow = 2,
 
-        --[[ Off, because it needs UnitXP SP3 and most installs do not have it.
-             Switching it on without that says so once rather than doing nothing
-             quietly -- a setting that appears to work and does not is worse than
-             one that is honestly unavailable. ]]--
-        losCheck = false,
+        --[==[ **On**, which it was not, because the client this runs on could
+             not answer and now can.
+
+             The reasoning for off was that it needs UnitXP SP3 and most installs
+             do not have it. Two things were wrong with that. UnitXP is not the
+             only source -- a native `IsUnitInSight` answers the same question --
+             and, more to the point, the check *works without either*: the
+             reactive latch reads the client's own refusal message, which is a
+             real signal on a stock 1.12 client and the only one there is.
+
+             So the fallback is not "nothing", it is "later and briefly", and the
+             module says so once. A player who steps behind a pillar and sees the
+             bar go violet has been told something true on any client; how
+             quickly depends on what is loaded. ]==]
+        losCheck = true,
 
         inRangeColor = { 0.20, 0.80, 0.25, 1 },
         tooCloseColor = { 0.95, 0.55, 0.10, 1 },
@@ -1088,7 +1098,14 @@ function M:Read()
          is exactly the half you needed. ]]--
     if self:Config().losCheck then
         if self:Sight() == false then return "nolos", yards end
-        if not OB.HasUnitXP() then self:WarnLineOfSightIsReactive() end
+
+        --[[ **The capability, not UnitXP.** This asked `OB.HasUnitXP`, which is
+             one of the two sources `OB.InSight` will use -- so a client with a
+             native `IsUnitInSight` and no SP3 got told its continuous check was
+             reactive while the continuous check was running. ]]--
+        if not OB.Can or not OB.Can("sight") then
+            self:WarnLineOfSightIsReactive()
+        end
     end
 
     if self.blindToHostiles then self:WarnBlindToHostiles() end
@@ -1127,7 +1144,8 @@ function M:WarnLineOfSightIsReactive()
 
     Say("line of sight is reactive on this client: the bar turns only after"
             .. " a shot is refused for it, and clears a couple of seconds later."
-            .. " Only a native |cff69ccf0IsUnitInSight|r can make it continuous.")
+            .. " |cff69ccf0UnitXP SP3|r or a native |cff69ccf0IsUnitInSight|r"
+            .. " makes it continuous.")
 end
 
 function M:WarnBlindToHostiles()
@@ -1264,26 +1282,53 @@ end
        left    the exact current distance
        right   the equipped attack's complete good range, in brackets
 
-     **One number, stepped to five yards, and the same steps for every kind of
-     target.** An exact distance is floored to the step; a band is already on one,
-     because every rung is a multiple of five. So a friendly unit measured
-     exactly at 23 yards and a mob narrowed to the 20-25 band both read "20y",
-     and the readout does not change character depending on what is selected --
-     which it did while the exact sources covered friendlies and the ladder
-     covered everything else.
+     **One number, and the same shape whatever measured it.** A measurement is
+     printed to the yard; a band is printed at its floor, which is a multiple of
+     five because every rung is. So `23y` and `20y` sit in the same place and
+     read the same way, and the readout does not change character when the
+     selection moves from something one source can measure to something only the
+     ladder can narrow.
 
-     Both ends are open and say so. The closest step reads "<5y" rather than
-     "0y" or "5y": inside five yards the step has no floor worth naming, and "0y"
-     reads as a failure rather than a distance. The far end reads "50y+", because
+     Both ends of a *band* are open and say so. Its floor reads "<5y" rather than
+     "0y" -- inside five yards the band has no floor worth naming, and "0y" reads
+     as a failure rather than a distance -- and its ceiling reads "50y+", because
      past fifty the rungs get coarse and one honest ceiling beats a number
-     pretending otherwise. ]]--
+     pretending otherwise. Neither applies to a measurement, which has its own
+     floor at "<1y" and no ceiling at all. ]]--
 local STEP = 5
 local STEP_CEILING = 50
 
-function M:DistanceText()
-    local low = self.bandLow
+--[==[ **A measured distance is printed as measured.**
 
-    if self.yards then low = math.floor(self.yards / STEP) * STEP end
+     It was not. Everything went through the five yard step above, including a
+     true reading -- so a target UnitXP put at 23.4 yards read `20y`, and the one
+     source on this client that knows the answer had it rounded off on the way to
+     the screen. That is the precision the extension exists to provide, discarded
+     by the code that asked for it.
+
+     The step was right for what it was written for. A band cannot be finer than
+     its rungs, and the ladder's rungs are multiples of five, so `20y` for the
+     20-25 band is the honest width of what was learned. None of that reasoning
+     survives contact with a number: a measurement is not a band, and rounding it
+     down to the nearest band does not make it more honest, only less true.
+
+     **The format stays the same either way**, which was the other half of the
+     original argument and the half that still holds: `23y` and `20y` read
+     identically, so the readout does not change character when the selection
+     moves from a friendly unit to a mob. It simply gets five times finer when
+     something can measure.
+
+     And no ceiling on a measurement. `50y+` is the ladder admitting its rungs
+     have run out; a measured 68 yards is 68 yards. ]==]
+function M:DistanceText()
+    if self.yards then
+        --[[ Under a yard reads `<1y` for the same reason the band's floor reads
+             `<5y`: `0y` is what a broken readout says, not a close one. ]]--
+        if self.yards < 1 then return "<1y" end
+        return OB.Round(self.yards) .. "y"
+    end
+
+    local low = self.bandLow
     if not low then return "" end
 
     if low >= STEP_CEILING then return STEP_CEILING .. "y+" end

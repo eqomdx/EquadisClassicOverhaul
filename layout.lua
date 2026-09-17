@@ -388,6 +388,349 @@ function OB.StopDrag()
     OB.RefreshPanel()
 end
 
+-- ---------------------------------------------------------------------------
+-- dragging the camera from on top of a frame
+-- ---------------------------------------------------------------------------
+
+--[==[ **A frame that takes the mouse takes the camera with it.**
+
+     1.12 gives a mouse-enabled frame every button that happens over it, whether
+     or not it has a handler for that button. So pressing the right button on a
+     nameplate, a unit frame or a party frame and dragging turns nothing: the
+     frame swallowed the press and the world never saw it. On a pull, plates
+     cover most of the screen, and the camera stops working wherever you happen
+     to point.
+
+     The blunt answer already existed and is a poor one -- Click Through
+     Nameplates switches their mouse off entirely, which buys the camera back by
+     giving up clicking a plate at all.
+
+     What this does instead is decide at the moment of release which of the two
+     it was:
+
+     **A press arms.** Nothing else happens; the cursor position is remembered.
+
+     **Movement while armed starts mouselook**, which is the client's own camera
+     turn and is what the world does with the same drag.
+
+     **A release without movement is a click**, and the frame's own handler runs
+     exactly as before -- so right-clicking a party member still opens the menu
+     and left-clicking a plate still targets.
+
+     Mouselook rather than `CameraOrSelectOrMoveStart`: the latter performs a
+     *select* in the world when it stops, which with the cursor over a plate is
+     a second targeting nobody asked for. Mouselook turns the view and does
+     nothing else.
+
+     Polled from the one OnUpdate rather than per frame. The mouse has one
+     position, so at most one frame can be armed, and a per-frame handler would
+     be a script on every plate on screen to watch a thing that is true of none
+     of them. ]==]
+local camera = { frame = nil, button = nil, x = 0, y = 0, turning = false }
+
+--[[ How far the cursor has to travel before a click becomes a drag. Four
+     pixels: a click delivered by a human hand moves one or two, and a drag that
+     needed five would feel stuck. ]]--
+local CAMERA_SLOP = 4
+
+function OB.CameraDragEnabled()
+    if not OB.profile or not OB.profile.cameraDrag then return false end
+    return type(MouselookStart) == "function"
+end
+
+--[[ A press on a frame that would otherwise swallow it. Records where the
+     cursor was; nothing turns until it moves. ]]--
+function OB.ArmCameraDrag(frame, button)
+    if not OB.CameraDragEnabled() then return false end
+
+    --[[ The right button only. Left is the game's select, and taking it would
+         make every click on a frame a potential camera turn -- which is the
+         opposite complaint from the one this fixes. ]]--
+    if button and button ~= "RightButton" then return false end
+
+    camera.frame = frame
+    camera.button = button
+    camera.turning = false
+    camera.swallow = false
+
+    if type(GetCursorPosition) == "function" then
+        camera.x, camera.y = GetCursorPosition()
+    else
+        camera.x, camera.y = 0, 0
+    end
+
+    return true
+end
+
+--[[ Called from the single OnUpdate. Starts the turn the moment the cursor has
+     moved far enough to mean one. ]]--
+function OB.StepCameraDrag()
+    if not camera.frame or camera.turning then return false end
+    if type(GetCursorPosition) ~= "function" then return false end
+
+    local x, y = GetCursorPosition()
+    local dx, dy = (x or 0) - camera.x, (y or 0) - camera.y
+
+    if (dx * dx) + (dy * dy) < (CAMERA_SLOP * CAMERA_SLOP) then return false end
+
+    camera.turning = true
+    MouselookStart()
+
+    return true
+end
+
+--[==[ **Release: was that a drag or a click?**
+
+     Answers `true` when it was a drag, which is the caller's signal to do
+     nothing else -- the menu it would otherwise open belongs to a click that
+     did not happen.
+
+     `IsMouselooking` is asked rather than trusted from the flag: something else
+     may have ended the turn, and stopping a mouselook nobody is in leaves the
+     cursor hidden. ]==]
+function OB.ReleaseCameraDrag()
+    local turned = camera.turning and true or false
+
+    camera.frame, camera.button, camera.turning = nil, nil, false
+
+    --[[ **Left standing for the click that is about to arrive.**
+
+         1.12 delivers `OnClick` *after* `OnMouseUp`, so a handler asking "was
+         that a drag" at click time is asking after this has already forgotten.
+         The answer is kept until somebody takes it -- see
+         `OB.ConsumeCameraDrag` -- and dropped by the next press either way, so
+         a flag can never survive into a later click. ]]--
+    camera.swallow = turned
+
+    if turned then
+        if type(IsMouselooking) ~= "function" or IsMouselooking() then
+            if type(MouselookStop) == "function" then MouselookStop() end
+        end
+    end
+
+    return turned
+end
+
+--[[ Was the click that is arriving the end of a camera turn? Answers once and
+     forgets, so two handlers on one frame cannot both swallow it. ]]--
+function OB.ConsumeCameraDrag()
+    if not camera.swallow then return false end
+
+    camera.swallow = false
+    return true
+end
+
+--[==[ **Both halves put on a frame at once.**
+
+     The existing handlers are kept and called: these are the client's own
+     frames as often as they are this addon's, and replacing a script is how a
+     nameplate stops being clickable at all. ]==]
+--[==[ **What you can do to a unit, on any frame that shows one.**
+
+     The party frames answer four gestures -- target, cast the queued spell,
+     offer the item on the cursor, and a right-click menu -- and the raid frames
+     answered one, which made them a readout rather than a raid frame. Asked for
+     in exactly those terms.
+
+     Lifted here rather than copied across, so the next fix lands once. It sits
+     beside `OB.AttachCameraDrag` because it is the same kind of thing: a
+     behaviour any frame showing a unit wants, owned by neither of the modules
+     that want it.
+
+     The unit is read off `frame.unit`, which both modules already set. ]==]
+function OB.UnitMenuFor(frame, menuType)
+    if not frame or not frame.GetName then return nil end
+    if frame.eqMenu then return frame.eqMenu end
+
+    if type(CreateFrame) ~= "function" then return nil end
+    if type(UIDropDownMenu_Initialize) ~= "function" then return nil end
+
+    local drop = CreateFrame("Frame", frame:GetName() .. "DropDown", frame,
+            "UIDropDownMenuTemplate")
+
+    --[==[ **The client's own menu for that kind of unit**, named rather than
+         built: "PARTY" is whisper, invite, promote, pass the loot rules,
+         uninvite, trade, follow and duel, and "RAID" is the raid's version of
+         the same list. Naming the set means an entry the client adds arrives
+         here without anybody noticing it was missing.
+
+         The unit is closed over rather than read off `this`, which
+         `ToggleDropDownMenu` leaves as whatever the caller had -- a detail that
+         has moved between clients and is not worth depending on. ]==]
+    UIDropDownMenu_Initialize(drop, function()
+        if type(UnitPopup_ShowMenu) == "function" then
+            UnitPopup_ShowMenu(drop, menuType or "PARTY", frame.unit)
+        end
+    end, "MENU")
+
+    --[[ The first menu built is what installs the Inspect fix; see above. ]]--
+    OB.InstallInspectTargeting()
+
+    frame.eqMenu = drop
+    return drop
+end
+
+--[==[ **Inspect targets first, because on this client it has to.**
+
+     The menu's Inspect entry hands the client the unit off the menu -- `raid7`
+     -- and the client will not open the inspect window for anything but your
+     target. So Inspect from a raid frame did nothing unless you had already
+     clicked the person, which is the report, and which makes the entry a
+     button that only works when you did not need it.
+
+     Targeting them first is what a person does by hand and the one path known
+     to work here. `UnitPopup_OnClick` is the client's own handler for every
+     entry on every unit menu, so it is wrapped once and the wrap steps in for
+     Inspect alone: target the unit, then let the client do exactly what it was
+     going to do -- with the menu's unit spelled as `target` for the length of
+     the call, in case the check is on the spelling rather than the identity.
+     Put back afterwards; the menu is closing anyway, but a field this addon
+     changed is a field it restores.
+
+     **Guarded on the saved original**, which is the durable artefact: the
+     wrapper reaches the addon by global name and outlives any `OB`. Installed
+     lazily, the first time a unit menu is built, so an install that never
+     opens one never touches the client's handler. ]==]
+function OB.InstallInspectTargeting()
+    if EquadisOverhaulBlizzUnitPopupClick then return false end
+    if type(UnitPopup_OnClick) ~= "function" then return false end
+
+    EquadisOverhaulBlizzUnitPopupClick = UnitPopup_OnClick
+
+    UnitPopup_OnClick = function()
+        local menuName = UIDROPDOWNMENU_INIT_MENU
+        local menu = menuName and getglobal(menuName)
+        local unit = menu and menu.unit
+
+        if this and this.value == "INSPECT" and unit
+                and type(TargetUnit) == "function"
+                and type(UnitExists) == "function" and UnitExists(unit)
+                and not (type(UnitIsUnit) == "function"
+                        and UnitIsUnit(unit, "target")) then
+            TargetUnit(unit)
+
+            menu.unit = "target"
+            local ok, err = pcall(EquadisOverhaulBlizzUnitPopupClick)
+            menu.unit = unit
+
+            if not ok then error(err, 0) end
+            return
+        end
+
+        return EquadisOverhaulBlizzUnitPopupClick()
+    end
+
+    return true
+end
+
+function OB.OpenUnitMenuFor(frame, menuType, x, y)
+    local drop = OB.UnitMenuFor(frame, menuType)
+    if not drop then return false end
+    if type(ToggleDropDownMenu) ~= "function" then return false end
+
+    ToggleDropDownMenu(1, nil, drop, frame:GetName(), x or 0, y or 0)
+    return true
+end
+
+--[==[ **An item on the cursor, given to them.**
+
+     `DropItemOnUnit` opens the trade window with the item already in it.
+     Guarded on the cursor actually holding something, because the call with an
+     empty cursor is not harmless: it opens an empty trade with whoever was
+     clicked, which is a window somebody then has to cancel. ]==]
+function OB.UnitDropOn(frame)
+    if not frame or not frame.unit then return false end
+    if type(CursorHasItem) ~= "function" or not CursorHasItem() then return false end
+    if type(DropItemOnUnit) ~= "function" then return false end
+
+    DropItemOnUnit(frame.unit)
+    return true
+end
+
+--[==[ **`PartyMemberFrame_OnClick`, transcribed, and now shared.**
+
+     Four outcomes and the order between them matters:
+
+     A right click while a spell is queued **cancels the spell** rather than
+     opening the menu. That is how every unit frame in the client behaves and it
+     is the only way to put a spell down without casting it -- so it is answered
+     before the menu, not after.
+
+     A left click casts the queued spell at them if there is one, offers the item
+     on the cursor if there is one, and otherwise targets. Targeting is last
+     because it is what the other two would fall through to, and a heal that
+     silently retargets instead of landing is the worst of the four. ]==]
+function OB.UnitGestureClick(frame, button, menuType, x, y)
+    if not frame or not frame.unit then return false end
+
+    local targeting = type(SpellIsTargeting) == "function"
+            and SpellIsTargeting() and true or false
+
+    if targeting and button == "RightButton" then
+        if type(SpellStopTargeting) == "function" then SpellStopTargeting() end
+        return true
+    end
+
+    if button == "RightButton" then
+        return OB.OpenUnitMenuFor(frame, menuType, x, y)
+    end
+
+    if targeting then
+        if type(SpellTargetUnit) == "function" then SpellTargetUnit(frame.unit) end
+        return true
+    end
+
+    if type(CursorHasItem) == "function" and CursorHasItem() then
+        return OB.UnitDropOn(frame)
+    end
+
+    if type(TargetUnit) == "function" then TargetUnit(frame.unit) end
+    return true
+end
+
+function OB.AttachCameraDrag(frame)
+    if not frame or not frame.SetScript or frame.eqCameraDrag then return false end
+    frame.eqCameraDrag = true
+
+    local downWas = frame.GetScript and frame:GetScript("OnMouseDown")
+    local upWas = frame.GetScript and frame:GetScript("OnMouseUp")
+
+    frame:SetScript("OnMouseDown", function()
+        EquadisClassicOverhaul.ArmCameraDrag(this, arg1)
+        if downWas then downWas() end
+    end)
+
+    frame:SetScript("OnMouseUp", function()
+        local turned = EquadisClassicOverhaul.ReleaseCameraDrag()
+
+        --[[ A drag is not a click, so the handler underneath does not run. A
+             plain press still reaches it untouched. ]]--
+        if not turned and upWas then upWas() end
+    end)
+
+    --[==[ **And the click, which is a third script rather than a consequence of
+         the second.**
+
+         A `Button` fires `OnClick` after `OnMouseUp`, from the client, and that
+         is where a unit frame opens its menu and a nameplate takes its target.
+         Without this the drag turns the camera *and* opens the menu it was
+         never meant to open.
+
+         Only where there is one to chain: most frames this is put on have no
+         `OnClick` at all, and giving one an empty handler would make it look
+         clickable to everything that asks. ]==]
+    local clickWas = frame.GetScript and frame:GetScript("OnClick")
+
+    if clickWas then
+        frame:SetScript("OnClick", function()
+            if EquadisClassicOverhaul.ConsumeCameraDrag() then return end
+            clickWas()
+        end)
+    end
+
+    return true
+end
+
 function OB.UpdateDrag()
     if not drag.active then return end
 
