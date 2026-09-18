@@ -416,7 +416,7 @@ end
      already in. Dismissing it hands the panel back to edit mode if edit mode is
      still on, and hides it otherwise. ]==]
 local EDIT_HELP = "Drag anything outlined. "
-        .. "Ctrl+Shift+Alt, or |cff69ccf0/eq edit|r, to finish."
+        .. "Ctrl+Shift+Alt, or |cff69ccf0/eqedit|r, to finish."
 
 function OB.EditPanel()
     if OB.editPanel then return OB.editPanel end
