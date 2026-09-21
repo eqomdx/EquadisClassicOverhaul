@@ -1158,11 +1158,14 @@ function M:Frame()
         end)
 
         b:SetScript("OnEnter", function()
-            EquadisClassicOverhaul.modules.bags:BagSlotTooltip(this)
+            local m = EquadisClassicOverhaul.modules.bags
+            m:BagSlotTooltip(this)
+            m:HighlightBag(this.ecoBag)
         end)
 
         b:SetScript("OnLeave", function()
             if GameTooltip then GameTooltip:Hide() end
+            EquadisClassicOverhaul.modules.bags:HighlightBag(nil)
         end)
 
         f.bagSlots[id] = b
@@ -1386,6 +1389,35 @@ function M:Button(index)
     b:SetHeight(ITEM)
     b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+
+    --[==[ **Press, drag, let go -- one motion**, which is how the client's
+         own bag slots move an item and how a hand expects to. This window
+         only answered clicks: pick up on one, put down on the next, and a
+         drag between them did nothing at all, because a button that has
+         not registered for a drag never hears one and a click is only a
+         click if the mouse comes up where it went down.
+
+         `OnDragStart` lifts the item the way a click does; `OnReceiveDrag`
+         is what the slot the mouse is let go over hears, and it takes
+         whatever is on the cursor -- the client's `ContainerFrameItemButton`
+         pair, transcribed. Marking mode is a mode for clicks and stays out
+         of it. ]==]
+    b:RegisterForDrag("LeftButton")
+
+    b:SetScript("OnDragStart", function()
+        local m = EquadisClassicOverhaul.modules.bags
+        if m.marking or not this.bag or not this.itemId then return end
+        if type(PickupContainerItem) ~= "function" then return end
+
+        PickupContainerItem(this.bag, this.slot)
+    end)
+
+    b:SetScript("OnReceiveDrag", function()
+        if not this.bag or type(PickupContainerItem) ~= "function" then return end
+        if not (CursorHasItem and CursorHasItem()) then return end
+
+        PickupContainerItem(this.bag, this.slot)
+    end)
 
     --[[ The empty slot's own artwork, which is what the client draws in a slot
          with nothing in it. Behind the icon rather than instead of it, so the
@@ -1647,70 +1679,128 @@ function M:SlotLocked(bag, slot)
     return locked and true or false
 end
 
+--[==[ **A pass, not a step: every move that can go out, goes out at once.**
+
+     The old engine made one move per client event. A move is a pickup and a
+     drop, both slots stay locked until the server confirms, and confirmation
+     is a round trip -- so sixty items took sixty round trips, which read on
+     screen as the bags shuffling one square at a time for the better part of
+     a minute. That was also the wrong shape for finding out why a sort was
+     stopping short: a run with a hundred small steps has a hundred places to
+     stop.
+
+     A pass reads the bags once and issues every move whose two slots are
+     free, marking both as in flight; the next pass waits until every slot
+     the last one touched is unlocked again and the client has said the bags
+     changed, then reads once more and issues the rest. The stacking pass
+     comes first and stands alone, because merging changes counts and frees
+     slots. Three or four passes tidy a full set of bags in a second or two.
+     shirsig's SortBags for 1.12 works this way, and it is why that one is
+     fast.
+
+     `self.touched` is the set of "bag:slot" keys the last pass moved. Each
+     pass begins by clearing it -- the run driver has already waited for
+     them -- so calling a pass on its own, as the tests do, always starts
+     clean. ]==]
+local function slotKey(row)
+    return tostring(row.bag) .. ":" .. tostring(row.slot)
+end
+
+--[[ One pickup and one drop, and both slots remembered as in flight.
+     Whatever is on the cursor would be dropped into the first slot touched
+     instead of the item we meant, so it is put back first. ]]--
+function M:Move(from, to)
+    if type(ClearCursor) == "function" then ClearCursor() end
+
+    PickupContainerItem(from.bag, from.slot)
+    PickupContainerItem(to.bag, to.slot)
+
+    self.touched = self.touched or {}
+    self.touched[slotKey(from)] = true
+    self.touched[slotKey(to)] = true
+    self.sortMoves = (self.sortMoves or 0) + 1
+
+    return true
+end
+
+--[[ A slot this pass may touch: not moved already this pass, and not in
+     flight from anything else. ]]--
+function M:SlotFree(row)
+    if self.touched and self.touched[slotKey(row)] then return false end
+    return not self:SlotLocked(row.bag, row.slot)
+end
+
+--[==[ **The stacking pass: every pair of loose piles that can be merged.**
+
+     Piles of one item are paired smallest onto largest, so a merge that does
+     not fit leaves the remainder where the bigger pile already was -- and
+     then the next pair, because both slots of a merged pair are in flight
+     and out of this pass. Answers `true` when it merged anything, `"locked"`
+     when a pile it would have merged is in flight, `false` when there is
+     nothing loose to stack. A favourite is never a pile. ]==]
 function M:CleanStep()
     if type(GetContainerItemInfo) ~= "function" then return false end
     if type(PickupContainerItem) ~= "function" then return false end
 
+    self.touched = {}
+
     local rows = self:ScanBags()
-    local seen = {}
-    local waiting = false
+    local piles, loose = {}, {}
 
     for i = 1, table.getn(rows) do
         local row = rows[i]
         local max = (not row.empty) and self:MaxStack(row.link) or 1
 
-        --[[ A full pile is not a partial one, and an unstackable item never has
-             a partial pile to find. Both are the same test. ]]--
+        --[[ A full pile is not a partial one, and an unstackable item never
+             has a partial pile to find. Both are the same test. ]]--
         local partial = (not row.empty) and row.id
                 and max > 1 and (row.count or 1) < max
 
         if partial and not self:IsFavourite(row.id) then
-            local other = seen[row.id]
+            loose[row.id] = (loose[row.id] or 0) + 1
 
-            if other then
-                --[[ The smaller onto the larger, so a move that does not fit
-                     leaves the remainder where the bigger pile already was.
-                     Bagshui sorts every partial stack largest-first for the same
-                     reason; with one move per pass the pair is enough. ]]--
-                local from, to = row, other
-                if (other.count or 1) < (row.count or 1) then
-                    from, to = other, row
-                end
-
-                if not self:SlotLocked(from.bag, from.slot)
-                        and not self:SlotLocked(to.bag, to.slot) then
-                    --[[ Whatever is on the cursor would be dropped into the
-                         first slot instead of the item we meant to move. ]]--
-                    if type(ClearCursor) == "function" then ClearCursor() end
-
-                    PickupContainerItem(from.bag, from.slot)
-                    PickupContainerItem(to.bag, to.slot)
-
-                    self.sortMoves = (self.sortMoves or 0) + 1
-                    return true
-                end
-
-                waiting = true
+            if self:SlotFree(row) then
+                piles[row.id] = piles[row.id] or {}
+                table.insert(piles[row.id], row)
             end
-
-            seen[row.id] = row
         end
     end
 
-    --[[ A pair that could not be merged because one half is still in flight
-         is a pair to come back to, not a bag that is done stacking. ]]--
-    if waiting then return "locked" end
+    local moved, blocked = false, false
+
+    for id, list in pairs(piles) do
+        table.sort(list, function(a, b) return (a.count or 1) > (b.count or 1) end)
+
+        while table.getn(list) >= 2 do
+            local to = table.remove(list, 1)
+            local from = table.remove(list)
+
+            self:Move(from, to)
+            moved = true
+        end
+
+        --[[ One pile left over with a partner in flight is a merge to come
+             back for, not a bag that is done stacking. ]]--
+        if table.getn(list) == 1 and (loose[id] or 0) >= 2 then blocked = true end
+    end
+
+    --[[ And an item whose every loose pile is in flight. ]]--
+    for id, n in pairs(loose) do
+        if n >= 2 and not piles[id] then blocked = true end
+    end
+
+    if moved then return true end
+    if blocked then return "locked" end
     return false
 end
 
---[==[ **Closing the gaps is not a pass of its own any more.**
+--[==[ **Closing the gaps is not a pass of its own.**
 
-     It was, because the old sorter compared the wanted order against the
-     *items* and so could reorder what was there without ever moving something
-     into a hole. Bagnon's compares the order against the *slots*, in bag order
-     -- so the n items land in the first n slots that will take them, and the
-     tidying and the ordering are the same pass. A second one would only be able
-     to undo it. ]==]
+     The old sorter compared the wanted order against the *items* and so could
+     reorder what was there without ever moving something into a hole. Bagnon's
+     compares the order against the *slots*, in bag order -- so the n items
+     land in the first n slots that will take them, and the tidying and the
+     ordering are the same pass. ]==]
 
 --[==[ **An item's quality, and its name.**
 
@@ -1855,31 +1945,26 @@ function M:FitsIn(row, family)
     return self:FamilyOverlap(self:ItemFamily(row.link), family)
 end
 
---[==[ **One move towards the order, then look again.**
+--[==[ **The ordering pass: every misplaced item that can move, moved.**
 
-     A move is a pickup and a drop, the client answers `BAG_UPDATE` when it
-     lands, and this runs again on that event. The alternative is issuing twenty
-     moves against a picture of the bags that stopped being true after the
-     first.
-
-     **Stacking first**, which is Bagnon's order and is the only order that
-     works: merging two piles frees a slot, so doing it after the ordering pass
-     would tidy the bag and then punch a hole in it.
-
-     **Then the ordering, family by family, the special bags first.** That is
-     `Sort:GetFamilies` sorting descending -- a quiver claims the arrows before
-     the ordinary bags get a chance at them, because the quiver is the only
-     place they can go. Doing it the other way round fills the normal bags with
-     ammunition and leaves the quiver empty.
+     Stacking first, and alone: merging frees slots and changes counts, so the
+     ordering waits a pass for it. Then, family by family with the special
+     bags first (`Sort:GetFamilies` descending -- a quiver claims the arrows
+     before the ordinary bags get a chance at them), the nth wanted item goes
+     to the nth slot. The pass keeps its own picture of where everything is
+     as it issues moves, so the twentieth move is aimed at where the bags
+     will be, not where they were when the pass began; and it skips any move
+     whose slot is already in flight, leaving it for the next pass.
 
      **A favourite is never moved.** It is somewhere on purpose, which is the
-     whole of what marking one means. ]==]
+     whole of what marking one means.
+
+     Answers `true` when it moved anything, `"locked"` when something is left
+     to do and every way of doing it is in flight, `false` when the bags are
+     in order. ]==]
 function M:SortStep()
     if type(PickupContainerItem) ~= "function" then return false end
 
-    --[[ `Sort:Iterate`'s first loop: merge every partial stack it can. Stopped
-         by a lock, the whole step waits: ordering around a pile that is about
-         to be merged away would move it and then move it again. ]]--
     local cleaned = self:CleanStep()
     if cleaned then return cleaned end
 
@@ -1899,6 +1984,16 @@ function M:SortStep()
         end
     end
 
+    --[[ The pass's own picture: a row is both a slot and, to begin with, the
+         item in it. `content[slot]` is the item there now and `pos[item]` the
+         slot it is in, and a move swaps the two pairs. ]]--
+    local content, pos = {}, {}
+
+    for i = 1, table.getn(spaces) do
+        content[spaces[i]] = spaces[i]
+        pos[spaces[i]] = spaces[i]
+    end
+
     --[[ `Sort:GetFamilies`, descending: special bags before ordinary ones. ]]--
     local seen, families = {}, {}
 
@@ -1913,6 +2008,7 @@ function M:SortStep()
     table.sort(families, function(a, b) return a > b end)
 
     local claimed = {}
+    local moved, pending = false, false
 
     for k = 1, table.getn(families) do
         local family = families[k]
@@ -1940,48 +2036,32 @@ function M:SortStep()
             local want, goal = order[i], slots[i]
             claimed[want] = true
 
-            if want ~= goal then
-                --[[ `Sort:Move`'s own guards. A locked slot is one already in
-                     flight, and a pickup aimed at it does nothing at all -- so
-                     the pass stops and the next bag update tries again. And
-                     whatever is standing in the goal has to be able to live
-                     where the wanted item came from, or the swap trades one
-                     misplaced item for another. ]]--
-                if self:SlotLocked(want.bag, want.slot)
-                        or self:SlotLocked(goal.bag, goal.slot) then
-                    return "locked"
-                end
+            local cur = pos[want]
 
-                if self:FitsIn(goal, want.eqFamily) then
-                    --[[ The same move asked for twice running means the client
-                         refused it the first time -- a bag it will not put
-                         that item in -- and would refuse it again. Stopping
-                         here is the difference between a sort that gives up
-                         and one that spends four hundred moves not moving. ]]--
-                    local key = want.bag .. ":" .. want.slot .. ">"
-                            .. goal.bag .. ":" .. goal.slot
+            if cur ~= goal then
+                local displaced = content[goal]
 
-                    if self.lastMove == key then
-                        self.lastMove = nil
-                        return false
-                    end
+                --[[ Both slots free, and whatever is standing in the goal able
+                     to live where the wanted item came from -- or the swap
+                     trades one misplaced item for another the client will
+                     refuse. ]]--
+                if not self:SlotFree(goal) or not self:SlotFree(cur) then
+                    pending = true
+                elseif not self:FitsIn(displaced, cur.eqFamily) then
+                    pending = true
+                else
+                    self:Move(cur, goal)
 
-                    self.lastMove = key
-
-                    --[[ Whatever is on the cursor would be dropped into the
-                         first slot touched instead of the item we meant. ]]--
-                    if type(ClearCursor) == "function" then ClearCursor() end
-
-                    PickupContainerItem(want.bag, want.slot)
-                    PickupContainerItem(goal.bag, goal.slot)
-
-                    self.sortMoves = (self.sortMoves or 0) + 1
-                    return true
+                    content[goal], pos[want] = want, goal
+                    content[cur], pos[displaced] = displaced, cur
+                    moved = true
                 end
             end
         end
     end
 
+    if moved then return true end
+    if pending then return "locked" end
     return false
 end
 
@@ -1994,36 +2074,29 @@ end
      both paths -- a bag already in that order was still sorted by something. ]==]
 local SORT_ORDER = "kind, then quality, then item level"
 
---[==[ **A step has three answers, and the run used to hear two.**
+--[==[ **The run: a pass, a wait for it to land, another pass.**
 
-     `SortStep` moved something (`true`), had nothing left to move (`false`), or
-     found the slot it wanted still locked from the previous move -- and it
-     answered that third case with `false` too. The run read `false` as
-     finished. So: one move, the client's `BAG_UPDATE` arrives while the two
-     slots it touched are still locked (it does -- the event comes per bag, and
-     the first one lands before the server has confirmed), the next step meets
-     the lock, and the sort ends with one item moved. Reported as the sort not
-     working at all, which from the front is what one move looks like.
+     Bounded three ways, because a run that never ends is worse than one that
+     stops short: a ceiling on passes, a ceiling on how many ticks a settle
+     may take, and a check that the bags actually changed after a pass that
+     moved something -- if they did not, the client refused the moves, and
+     asking again is what the old engine spent four hundred moves doing. The
+     refusal is said out loud, with the first move that was refused, because
+     "the sort stops after the first bag" is a report about exactly this and
+     nothing on screen said which move.
 
-     `"locked"` is the third answer now: keep the run alive and try again on the
-     next event. Bounded, because a lock that never clears would otherwise keep
-     a run open for the rest of the session. ]==]
-local MAX_MOVES = 400
+     The settle waits for two things: every slot the last pass touched to be
+     unlocked, and the client to have said something since (`BAG_UPDATE` or
+     `ITEM_LOCK_CHANGED`) -- or a second to have passed, for a client that
+     says nothing. The lock alone is not enough: a refused move never locks
+     at all. ]==]
+local MAX_PASSES = 40
 local MAX_WAITS = 60
+local SETTLE_GRACE = 1.0
 
---[==[ **The clock drives the run as well as the client's events.**
-
-     Driven by events alone the run stalls. The client's last
-     `ITEM_LOCK_CHANGED` for a move can arrive while `GetContainerItemInfo`
-     still answers locked for the other slot; the step waits for the next
-     event, and there is no next event until the player does something. Two
-     bags tidied and three not -- "working better, but not across all bags",
-     which is what a stall looks like from the front.
-
-     Bagshui restacks on a timer and nothing else -- a move every 0.15 s, half
-     a second when a slot is locked -- and on this client that is the right
-     instrument. The events stay, because they are earlier when they do
-     come; the ticker is what makes sure they are not the only thing. ]==]
+--[[ Bagshui restacks on a timer, a move every 0.15 s, and on this client
+     that is the right instrument: the events are earlier when they come,
+     and the ticker is what makes sure they are not the only thing. ]]--
 local SORT_TICK = 0.15
 
 function M:SortTicker()
@@ -2052,19 +2125,53 @@ function M:SortTicker()
     return ticker
 end
 
-function M:EndRun()
+--[[ Every slot, what is in it and how many: the bags as one string, so two
+     readings can be compared. ]]--
+function M:Shape()
+    local rows = self:ScanBags()
+    local parts = {}
+
+    for i = 1, table.getn(rows) do
+        local row = rows[i]
+        table.insert(parts, slotKey(row) .. "=" .. tostring(row.link or "")
+                .. "x" .. tostring(row.count or 0))
+    end
+
+    return table.concat(parts, ";")
+end
+
+function M:EndRun(why)
     self.sorting = nil
     if self.ticker then self.ticker:Hide() end
+
+    if why then Say(why) end
     return true
+end
+
+--[[ One pass, and the bookkeeping the driver needs to know whether it
+     landed: what the bags looked like before it, whether it moved anything,
+     and when. ]]--
+function M:RunPass()
+    self.shapeBefore = self:Shape()
+    self.bagUpdated = nil
+    self.passAt = (type(GetTime) == "function" and GetTime()) or 0
+
+    local step = self:SortStep()
+
+    self.passIssued = (step == true)
+    if step == true then self.sortPasses = (self.sortPasses or 0) + 1 end
+
+    return step
 end
 
 function M:Sort()
     self.sorting = true
     self.sortMoves = 0
     self.sortWaits = 0
-    self.lastMove = nil
+    self.sortPasses = 0
+    self.touched = {}
 
-    local step = self:SortStep()
+    local step = self:RunPass()
 
     if not step then
         self:EndRun()
@@ -2080,6 +2187,36 @@ function M:Sort()
     return true
 end
 
+function M:Wait()
+    self.sortWaits = (self.sortWaits or 0) + 1
+
+    if self.sortWaits >= MAX_WAITS then
+        self:EndRun("stopped: a slot stayed locked for too long.")
+    end
+
+    return true
+end
+
+--[[ Whether the last pass has landed: nothing it touched is still in
+     flight, and the client has said the bags changed -- or long enough has
+     passed that it is not going to. ]]--
+function M:Settled()
+    for key in pairs(self.touched or {}) do
+        local _, _, bag, slot = string.find(key, "^(-?%d+):(%d+)$")
+
+        if bag and self:SlotLocked(tonumber(bag), tonumber(slot)) then
+            return false
+        end
+    end
+
+    if self.passIssued and not self.bagUpdated then
+        local now = (type(GetTime) == "function" and GetTime()) or 0
+        if (now - (self.passAt or 0)) < SETTLE_GRACE then return false end
+    end
+
+    return true
+end
+
 --[[ The step that keeps a run going, driven by the client telling us a move
      landed -- `BAG_UPDATE` when the contents change, `ITEM_LOCK_CHANGED` when a
      slot is released, either may be the one that arrives last -- and by the
@@ -2087,23 +2224,31 @@ end
 function M:ContinueRun()
     if not self.sorting then return false end
 
-    if (self.sortMoves or 0) >= MAX_MOVES then
-        self:EndRun()
-        return true
+    if (self.sortPasses or 0) >= MAX_PASSES then
+        return self:EndRun("stopped: too many passes.")
     end
 
-    local step = self:SortStep()
+    if not self:Settled() then return self:Wait() end
 
-    if step == "locked" then
-        self.sortWaits = (self.sortWaits or 0) + 1
-        if self.sortWaits >= MAX_WAITS then self:EndRun() end
-        return true
+    --[[ A pass that moved things and changed nothing was refused by the
+         client. Said, with the first move it asked for, and stopped. ]]--
+    if self.passIssued and self:Shape() == self.shapeBefore then
+        local first
+        for key in pairs(self.touched or {}) do first = first or key end
+
+        return self:EndRun("stopped: the client refused a move"
+                .. (first and (" (slot " .. first .. ")") or "") .. ".")
     end
 
-    if step then
+    local step = self:RunPass()
+
+    if step == true then
         self.sortWaits = 0
+    elseif step == "locked" then
+        self:Wait()
     else
-        self:EndRun()
+        self:EndRun("sorted: " .. tostring(self.sortMoves or 0) .. " moves in "
+                .. tostring(self.sortPasses or 0) .. " passes.")
     end
 
     return true
@@ -2322,6 +2467,10 @@ function M:Draw()
 
     for index = total + 1, table.getn(f.buttons) do f.buttons[index]:Hide() end
 
+    --[[ A redraw under the mouse hands the buttons round again; the lit set
+         follows the bag, not the buttons. ]]--
+    if f.litBag then self:HighlightBag(f.litBag) end
+
     local gridW = columns * pitch * scale
     local gridH = lines * pitch * scale
     if gridH < pitch then gridH = pitch end
@@ -2508,6 +2657,31 @@ end
 --[[ The client's own gesture: whatever is on the cursor goes in the slot, and
      nothing on the cursor picks the bag up. The backpack cannot be taken off,
      so it only accepts. ]]--
+--[==[ **Hovering a worn bag lights the slots that are in it.**
+
+     Bagnon's `BagSlot:OnEnter` does this, and it answers the one question
+     the grid cannot otherwise answer: which of these sixty squares are in
+     *that* bag. Lit with each slot's own highlight, locked on -- the
+     client's `ButtonHilight-Square`, the same light the mouse puts on a
+     slot -- so the row reads as "these, as though hovered" rather than as a
+     new colour with a meaning to learn. `nil` puts every light out. ]==]
+function M:HighlightBag(id)
+    local f = self:Frame()
+    f.litBag = id
+
+    for i = 1, table.getn(f.buttons or {}) do
+        local b = f.buttons[i]
+
+        if id and b.bag == id and b:IsShown() then
+            if b.LockHighlight then b:LockHighlight() end
+        elseif b.UnlockHighlight then
+            b:UnlockHighlight()
+        end
+    end
+
+    return true
+end
+
 function M:ClickBagSlot(id)
     if id == FIRST_BAG then
         if type(PutItemInBackpack) == "function" then PutItemInBackpack() end
@@ -2988,8 +3162,10 @@ function M:OnEvent()
     end
 
     --[[ A move landing is what drives the next one -- and a lock clearing is
-         the other half of a move landing. ]]--
+         the other half of a move landing. Either is the client saying the
+         bags changed, which is what a pass waits to hear. ]]--
     if event == "BAG_UPDATE" or event == "ITEM_LOCK_CHANGED" then
+        if self.sorting then self.bagUpdated = true end
         self:ContinueRun()
     end
 

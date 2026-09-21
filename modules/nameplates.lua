@@ -467,6 +467,11 @@ local M = OB.RegisterModule({
              ignored: the orb is the client's red. ]]--
         comboSize = 12,
 
+        --[[ All five sockets on the target's plate, filling as the points
+             come -- the way the target frame shows them. Off, only earned
+             points are drawn and nothing at all at nought. ]]--
+        comboSockets = true,
+
         castbar = true,
         castTargetOnly = false,
         castbarHeight = 8,
@@ -687,6 +692,8 @@ local M = OB.RegisterModule({
           nil, nil, "@plates_dps_mode" },
         { "Show Combo Points On Target", "showCombo", "boolean",
           nil, nil, nil, nil, nil, "@plates_no_combo" },
+        { "Show Empty Combo Sockets", "comboSockets", "boolean",
+          nil, nil, nil, nil, nil, "!showCombo" },
         { "Combo Point Size", "comboSize", "slider", 8, 20, 1,
           nil, nil, "!showCombo" },
 
@@ -1089,11 +1096,19 @@ function M:ResetPlateIdentity(plate)
     end
 end
 
---[[ The cut of `UI-ComboPoint` the target frame uses -- ring, orb -- read
-     off the client's own `ComboPoint1Highlight` where it has built one, with
-     the 1.12 numbers standing in on a client that has not. Answered once;
-     `force` reads again. ]]--
-local COMBO_ART = "Interface\\TargetingFrame\\UI-ComboPoint"
+--[==[ **The target frame's combo art, shipped as this addon's own file.**
+
+     `textures\\combopoint.tga` is `Interface\\ComboFrame\\ComboPoint` out of
+     the client's own archive, pixel for pixel: one 32x16 sheet, the socket
+     ring in the first twelve columns, the red orb in the next six, the shine
+     in the last fourteen. Shipped rather than referenced so that it can be
+     edited -- the file is the one to change, and the layout has to stay
+     three cells across for the cuts below to land.
+
+     The cuts are read off the client's own `ComboPoint1Highlight` and
+     `ComboPoint1Shine` where it has built them, with the client's numbers
+     standing in where it has not. Answered once; `force` reads again. ]==]
+local COMBO_ART = OB.mediaPath .. "textures\\combopoint"
 local comboArtCache
 
 local function comboArt(force)
@@ -1108,9 +1123,6 @@ local function comboArt(force)
 
         if type(ulx) == "number" and type(urx) == "number" then
             art.orb = { ulx, urx, uly or 0, lly or 1 }
-
-            local file = t.GetTexture and t:GetTexture()
-            if type(file) == "string" then art.file = file end
         end
     end
 
@@ -1268,29 +1280,34 @@ function M:Adopt(frame)
     end
 
     --[==[ **The client's own combo points**, cut from the art the target
-         frame draws them with. `UI-ComboPoint` is one 32x16 file: the socket
-         ring in its first 0.375, the red orb to 0.5625, the shine in the
-         rest. Each earned point here is a lit socket -- ring over orb, as the
-         target frame stacks them -- and an unearned one is nothing, which is
-         what the six-pixel squares did and what a plate has room for. The
-         orb's cut is read off `ComboPoint1Highlight` where the client has
-         built it, so it is the same red circle the target frame lights. ]==]
+         frame draws them with: one 32x16 sheet, the socket ring in its first
+         0.375, the red orb to 0.5625, the shine in the rest. Five sockets on
+         the target's plate and an orb lit in each earned one, ring over orb
+         as the target frame stacks them -- see `Refresh`. The orb's cut is
+         read off `ComboPoint1Highlight` where the client has built it, so it
+         is the same red circle the target frame lights. ]==]
     local art = comboArt()
 
     plate.comboOrbs = {}
 
+    --[[ The orb ABOVE the ring, on a higher layer, as the client's own
+         template has it (ring BACKGROUND, highlight ARTWORK): the socket is
+         not a hole but a dark centre, so a ring drawn over the orb covers
+         the very thing that says the point is earned. Same layer and
+         creation order was not enough -- the sockets showed and never
+         filled. ]]--
     for i = 1, 5 do
+        local point = plate.overlay:CreateTexture(nil, "ARTWORK")
+        point:SetTexture(art.file)
+        point:SetTexCoord(art.ring[1], art.ring[2], art.ring[3], art.ring[4])
+        point:Hide()
+        plate.combo[i] = point
+
         local orb = plate.overlay:CreateTexture(nil, "OVERLAY")
         orb:SetTexture(art.file)
         orb:SetTexCoord(art.orb[1], art.orb[2], art.orb[3], art.orb[4])
         orb:Hide()
         plate.comboOrbs[i] = orb
-
-        local point = plate.overlay:CreateTexture(nil, "OVERLAY")
-        point:SetTexture(art.file)
-        point:SetTexCoord(art.ring[1], art.ring[2], art.ring[3], art.ring[4])
-        point:Hide()
-        plate.combo[i] = point
     end
 
     if plate.raidicon and plate.raidicon.SetParent then
@@ -3468,16 +3485,22 @@ function M:Refresh(plate)
     self:RefreshGlow(plate, plate.istarget)
     self:RefreshDebuffs(plate, unit, name, level)
 
-    local points = 0
-    if plate.istarget and cfg.showCombo then points = self:ComboPoints() end
+    --[[ Sockets first, orbs as the points come: five empty rings on the
+         target's plate that fill up, which is what the target frame does
+         and what "stacking" turned out to mean. With the sockets switched
+         off only the earned points are drawn. ]]--
+    local points, sockets = 0, false
+
+    if plate.istarget and cfg.showCombo then
+        points = self:ComboPoints()
+        sockets = cfg.comboSockets ~= false
+    end
+
     for i = 1, 5 do
-        if i <= points then
-            plate.combo[i]:Show()
-            plate.comboOrbs[i]:Show()
-        else
-            plate.combo[i]:Hide()
-            plate.comboOrbs[i]:Hide()
-        end
+        local lit = i <= points
+
+        if sockets or lit then plate.combo[i]:Show() else plate.combo[i]:Hide() end
+        if lit then plate.comboOrbs[i]:Show() else plate.comboOrbs[i]:Hide() end
     end
 end
 

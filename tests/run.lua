@@ -24049,6 +24049,52 @@ Stub.SetBag(0, { slots = 4, [1] = { name = "Bread", quality = 1, count = 5 } })
 
 eq(bags:SortStep(), false, "and a bag already in order is left alone")
 
+--[==[ **One pass issues every move it can, not one.** Four items out of
+     order: the first swap puts the epic first and takes two slots out of
+     the pass; the plate and the elixir are on two other slots and swap in
+     the same pass. Two moves from one call, where there used to be one --
+     and the two left over wait for the next pass, because their slots are
+     in flight. ]==]
+Stub.items[8104] = { name = "Elixir of the Mongoose", rarity = 1, maxStack = 5,
+        itemType = "Consumable", subType = "Potion" }
+Stub.items[8105] = { name = "Sunder Plate", rarity = 3, maxStack = 1,
+        itemType = "Armor", subType = "Plate", equipLoc = "INVTYPE_CHEST" }
+Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1 }
+Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20 }
+Stub.itemIds["Elixir of the Mongoose"] = 8104
+Stub.itemIds["Sunder Plate"] = 8105
+Stub.itemIds["Sulfuras"] = 8102
+Stub.itemIds["Tough Jerky"] = 8103
+
+Stub.bags = {}
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [2] = { name = "Sunder Plate", quality = 3, count = 1 },
+    [3] = { name = "Sulfuras", quality = 5, count = 1 },
+    [4] = { name = "Elixir of the Mongoose", quality = 1, count = 1 },
+})
+Stub.SettleBags()
+bags.sortMoves = 0
+
+eq(bags:SortStep(), true, "four items out of order is a pass with work in it")
+eq(bags.sortMoves, 2, "and it sends two moves at once, on four different slots",
+        tostring(bags.sortMoves))
+check(bags.touched["0:1"] and bags.touched["0:3"] and bags.touched["0:2"] and bags.touched["0:4"],
+        "every slot it touched is remembered as in flight")
+
+Stub.SettleBags()
+eq(bags:SortStep(), true, "the next pass sends what was left")
+Stub.SettleBags()
+eq(bags:SortStep(), false, "and then the bag is in order")
+eq(Stub.bags[0][1].name, "Sulfuras", "the epic first")
+eq(Stub.bags[0][2].name, "Tough Jerky", "the jerky second")
+eq(Stub.bags[0][3].name, "Elixir of the Mongoose", "the elixir third")
+eq(Stub.bags[0][4].name, "Sunder Plate", "and the plate last")
+
+Stub.items[8104], Stub.items[8105], Stub.items[8102], Stub.items[8103] = nil, nil, nil, nil
+Stub.itemIds["Elixir of the Mongoose"], Stub.itemIds["Sunder Plate"] = nil, nil
+Stub.itemIds["Sulfuras"], Stub.itemIds["Tough Jerky"] = nil, nil
+
 --[==[ **A favourite is never moved.** It is somewhere on purpose, which is the
      whole of what marking one means, and tidying is not a reason to overrule
      it. ]==]
@@ -24205,6 +24251,13 @@ event = nil
 
 check(not bags.sorting, "and the run finishes",
         "moves=" .. tostring(bags.sortMoves) .. " waits=" .. tostring(bags.sortWaits))
+
+--[==[ **In a handful of passes, not a move per round trip.** Every move whose
+     slots are free goes out in the same pass; the next pass waits for them
+     to land and sends the rest. Five bags tidy in three or four passes,
+     where the old engine took one round trip per item. ]==]
+check((bags.sortPasses or 0) <= 4, "five bags are tidied in a handful of passes",
+        "passes=" .. tostring(bags.sortPasses) .. " moves=" .. tostring(bags.sortMoves))
 
 --[[ Walk every slot in bag order: items first, then nothing, and the items
      in the sort's own order. ]]--
@@ -24690,6 +24743,82 @@ eq(GLOBAL_stripPoint, "TOPLEFT", "the strip hangs under the grid")
 eq(GLOBAL_stripRel, bags:Frame().grid, "off the grid itself")
 eq(GLOBAL_stripRelPoint, "BOTTOMLEFT", "at its bottom left corner")
 
+--[==[ **Hovering a worn bag lights the slots that are in it**, with each
+     slot's own highlight held on -- the light the mouse puts on a slot --
+     and nothing on the slots of any other bag. Leaving puts them out. ]==]
+Stub.bags = {}
+Stub.SetBag(0, { slots = 4, [1] = { name = "Bread", quality = 1, count = 5 } })
+Stub.SetBag(1, { slots = 4, [2] = { name = "Bread", quality = 1, count = 2 } })
+bags:Draw()
+
+GLOBAL_litIn, GLOBAL_litOut = 0, 0
+function GLOBAL_countLit()
+    GLOBAL_litIn, GLOBAL_litOut = 0, 0
+    for GLOBAL_i = 1, table.getn(bags:Frame().buttons) do
+        local b = bags:Frame().buttons[GLOBAL_i]
+        if b:IsShown() and b.highlightLocked then
+            if b.bag == 1 then GLOBAL_litIn = GLOBAL_litIn + 1
+            else GLOBAL_litOut = GLOBAL_litOut + 1 end
+        end
+    end
+end
+
+Stub.Hover(bags:Frame().bagSlots[1])
+GLOBAL_countLit()
+eq(GLOBAL_litIn, 4, "hovering the first bag lights all four of its slots")
+eq(GLOBAL_litOut, 0, "and none of the backpack's")
+
+--[[ The grid redrawing under the mouse keeps the same bag lit. ]]--
+bags:Draw()
+GLOBAL_countLit()
+eq(GLOBAL_litIn, 4, "a redraw under the mouse keeps them lit")
+
+Stub.Unhover(bags:Frame().bagSlots[1])
+GLOBAL_countLit()
+eq(GLOBAL_litIn + GLOBAL_litOut, 0, "and leaving the bag puts them out")
+
+--[==[ **Press, drag, let go moves an item in one motion.** A drag starting
+     on a full slot lifts it; letting go over another slot drops it there.
+     Marking mode is for clicks and a drag in it lifts nothing. ]==]
+GLOBAL_from, GLOBAL_to = nil, nil
+for GLOBAL_i = 1, table.getn(bags:Frame().buttons) do
+    local b = bags:Frame().buttons[GLOBAL_i]
+    if b.bag == 0 and b.slot == 1 then GLOBAL_from = b end
+    if b.bag == 1 and b.slot == 4 then GLOBAL_to = b end
+end
+check(GLOBAL_from and GLOBAL_to, "the bread and an empty slot are both drawn")
+
+this = GLOBAL_from
+GLOBAL_from:GetScript("OnDragStart")()
+check(CursorHasItem(), "a drag starting on an item lifts it")
+
+this = GLOBAL_to
+GLOBAL_to:GetScript("OnReceiveDrag")()
+this = nil
+check(not CursorHasItem(), "letting go over a slot puts it down")
+Stub.SettleBags()
+eq(Stub.bags[1][4] and Stub.bags[1][4].name, "Bread", "in that slot",
+        tostring(Stub.bags[1][4] and Stub.bags[1][4].name))
+eq(Stub.bags[0][1], nil, "and out of the one it left")
+
+bags:Draw()
+GLOBAL_from = nil
+for GLOBAL_i = 1, table.getn(bags:Frame().buttons) do
+    local b = bags:Frame().buttons[GLOBAL_i]
+    if b.bag == 1 and b.slot == 4 then GLOBAL_from = b end
+end
+bags.marking = true
+this = GLOBAL_from
+GLOBAL_from:GetScript("OnDragStart")()
+this = nil
+check(not CursorHasItem(), "in marking mode a drag lifts nothing")
+bags.marking = nil
+
+Stub.SetBag(0, {})
+Stub.SetBag(1, nil)
+Stub.bags = {}
+bags:Draw()
+
 --[==[ **Money, against the grid rather than against the window.**
 
      `PlaceMoney` anchors the money frame's top right to the item group's bottom
@@ -25015,12 +25144,19 @@ Stub.SetBag(0, { slots = 4,
     [3] = { name = "Arrow", quality = 1, count = 5 },
 })
 Stub.SettleBags()
+--[[ The arrow was left a favourite by an earlier block, and a favourite is
+     never moved -- so this fixture had nothing to refuse and the old
+     assertions passed on a run that did nothing. ]]--
+bags:SetFavourite(7777, nil)
+
 GLOBAL_refusePickup = PickupContainerItem
 PickupContainerItem = function(bag, slot)
     --[[ The client saying no: the item goes back where it was, nothing locks. ]]--
     Stub.cursor = nil
 end
+Stub.chat = {}
 bags:Sort()
+check(bags.sorting, "a bag out of order starts a run")
 for GLOBAL_i = 1, 10 do
     if not bags.sorting then break end
     event = "BAG_UPDATE"
@@ -25031,6 +25167,8 @@ PickupContainerItem = GLOBAL_refusePickup
 check(not bags.sorting, "a refused move ends the run")
 check((bags.sortMoves or 0) <= 2, "after at most one repeat",
         tostring(bags.sortMoves))
+check(string.find(table.concat(Stub.chat, " | "), "refused a move", 1, true) ~= nil,
+        "and says so, with the slot", table.concat(Stub.chat, " | "))
 
 Stub.items[7777], Stub.items[8888], Stub.items[9001] = nil, nil, nil
 Stub.itemIds["Arrow"], Stub.itemIds["Bread"] = nil, nil
@@ -27759,19 +27897,46 @@ Stub.player.targetsTarget = nil
 cfg.showCombo = true
 Stub.player.combo = 3
 
+--[==[ **Five sockets, filling as the points come.** The target's plate shows
+     all five empty rings and lights an orb in each earned one -- what the
+     target frame does, and what "the points aren't stacking" meant. ]==]
 plates:Refresh(adoptedEnemy)
-eq(adoptedEnemy.combo[3].shown, true, "three points show three")
-eq(adoptedEnemy.combo[4].shown, false, "and not four")
+eq(adoptedEnemy.combo[3].shown, true, "three points show three lit sockets")
+eq(adoptedEnemy.combo[4].shown, true, "and the fourth socket, empty")
+eq(adoptedEnemy.combo[5].shown, true, "and the fifth")
 
 --[==[ **They are the target frame's own orbs.** Each earned point is the
-     client's socket ring with the red orb lit inside it, cut from
-     `UI-ComboPoint` the way the target frame cuts it -- the orb's cut read
-     off `ComboPoint1Highlight` itself. Six-pixel coloured squares were what
-     this replaced. ]==]
+     client's socket ring with the red orb lit inside it, cut the way the
+     target frame cuts it -- the orb's cut read off `ComboPoint1Highlight`
+     itself. Six-pixel coloured squares were what this replaced. ]==]
 eq(adoptedEnemy.comboOrbs[3].shown, true, "with the orb lit inside the socket")
 eq(adoptedEnemy.comboOrbs[4].shown, false, "and not in the fourth")
-eq(adoptedEnemy.comboOrbs[1]:GetTexture(), ComboPoint1Highlight:GetTexture(),
-        "the orb is the target frame's own texture")
+
+--[[ The socket is a dark centre, not a hole: the orb has to be on a layer
+     above it or the ring covers the fill. Same layer, drawn later, was not
+     enough -- the sockets showed and never filled. ]]--
+eq(adoptedEnemy.combo[1].layer, "ARTWORK", "the ring is on the artwork layer")
+eq(adoptedEnemy.comboOrbs[1].layer, "OVERLAY", "and the orb on the overlay above it")
+
+--[[ At nought the sockets stay, empty: the plate is still the target. ]]--
+Stub.player.combo = 0
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, true, "at no points the sockets are still there")
+eq(adoptedEnemy.comboOrbs[1].shown, false, "with nothing lit")
+
+--[[ Switched off, only earned points are drawn -- and nothing at nought. ]]--
+cfg.comboSockets = false
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, false, "sockets off: nothing at no points")
+Stub.player.combo = 3
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[3].shown, true, "three points show three")
+eq(adoptedEnemy.combo[4].shown, false, "and not a fourth socket")
+cfg.comboSockets = true
+plates:Refresh(adoptedEnemy)
+check(string.find(adoptedEnemy.comboOrbs[1]:GetTexture() or "", "textures" .. string.char(92) .. "combopoint", 1, true) ~= nil,
+        "the orb is this addon's own copy of the target frame's art",
+        tostring(adoptedEnemy.comboOrbs[1]:GetTexture()))
 GLOBAL_clientOrb = { ComboPoint1Highlight:GetTexCoord() }
 GLOBAL_plateOrb = { adoptedEnemy.comboOrbs[1]:GetTexCoord() }
 near(GLOBAL_plateOrb[1], GLOBAL_clientOrb[1], 0.0001, "cut where the client cuts it (left)")
@@ -27818,10 +27983,9 @@ plates:Refresh(adoptedFriend)
 eq(adoptedFriend.combo[1].shown, false, "a plate that is not the target shows none")
 
 Stub.player.combo = 0
-plates:Refresh(adoptedEnemy)
-eq(adoptedEnemy.combo[1].shown, false, "and none means none")
-
 cfg.showCombo = false
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, false, "and switched off means none")
 
 -- ---------------------------------------------------------------------------
 -- cast bars, which are the one thing here that is not target-only

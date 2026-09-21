@@ -1293,6 +1293,11 @@ function CreateFrame(ftype, name, parent, template)
     f.GetHighlightTexture = function(self) return self.highlightTex end
     f.GetCheckedTexture = function(self) return self.checkedTex end
 
+    --[[ A button's highlight held on without the mouse, which is how the
+         bag window points at a bag's slots. Recorded, so a test can ask. ]]--
+    f.LockHighlight = function(self) self.highlightLocked = true end
+    f.UnlockHighlight = function(self) self.highlightLocked = nil end
+
     --[[ The two tooltip setters, which is the only way an addon can learn what
          a unit's aura is called. Separate because the client's lists are
          numbered separately -- see `Stub.AuraNamed`. ]]--
