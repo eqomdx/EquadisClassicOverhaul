@@ -258,7 +258,7 @@ end
      automatically for a rogue would move a hunter's bars. Restack Occupied Bars
      does it on demand -- see constraint 15. ]]--
 OB.defaults = {
-    schema = 43,
+    schema = 44,
 
     -- visibility
     show = true,
@@ -1576,6 +1576,15 @@ OB.profileMigrations = {
     { 43, function(p)
         local b = p.modules and p.modules.bags
         if b and b.iconInset == 3 then b.iconInset = 0 end
+    end },
+
+    --[[ **The stat text, a size smaller.** Nine was the shipped size and was
+         still read as too big beside the client's own labels. The shipped
+         nine moves to eight; a size somebody dragged to stays, for the reason
+         schema 43 gives. ]]--
+    { 44, function(p)
+        local c = p.modules and p.modules.characterpanel
+        if c and c.statFontSize == 9 then c.statFontSize = 8 end
     end },
 }
 

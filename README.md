@@ -37,7 +37,8 @@ to lock. Notices — a setting that needs a reload, for instance — appear in t
 same banner.
 
 Other windows have their own commands: `/bags`, `/way` (waypoints), `/db` (item
-database), `/tt` (chat scan), `/us` (UnitScan), `/addons`, `/autoneed`,
+database), `/chatscan` (ChatScan: `/chatscan`, `/chatscan 50-60`, `/chatscan
+stop`), `/tt` (tell target), `/us` (UnitScan), `/addons`, `/autoneed`,
 `/autogreed`.
 
 ## Modules

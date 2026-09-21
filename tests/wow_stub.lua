@@ -577,8 +577,15 @@ end
      exercises the same chain the game does rather than a shortcut. ]]--
 --[[ A dropdown needs to be a real frame that remembers its initialiser --
      that is the whole of what the addon uses it for. ]]--
+--[[ The client's dropdown carries a `$parentText` font string for the chosen
+     entry; anything sizing the pane's text has to reach it by that name. ]]--
 templates.UIDropDownMenuTemplate = function(frame)
     frame.initialize = frame.initialize or nil
+
+    local name = frame.GetName and frame:GetName()
+    if name then
+        _G[name .. "Text"] = newFontString(frame, "OVERLAY", "GameFontHighlightSmall")
+    end
 end
 
 --[==[ **`ItemButtonTemplate`, which was not modelled at all.**
@@ -686,9 +693,15 @@ templates.GameTooltipTemplate = function(frame)
         return self.lines[i]
     end
 
+    --[==[ **Clearing keeps the text.** The client's `ClearLines` drops the
+         count and hides the line font strings; it does not blank them, so a
+         line past `NumLines()` still answers `GetText()` with whatever the
+         last tooltip left there. This blanked every line, which agreed with a
+         reader that walks to the first nil -- and such a reader, in game,
+         reads the previous item's tail as this item's. ]==]
     frame.ClearLines = function(self)
         self.lineCount = 0
-        for i = 1, table.getn(self.lines) do self.lines[i]:SetText("") end
+        for i = 1, table.getn(self.lines) do self.lines[i]:Hide() end
     end
 
     frame.NumLines = function(self) return self.lineCount end
@@ -723,6 +736,7 @@ templates.GameTooltipTemplate = function(frame)
     frame.AddLine = function(self, text)
         self.lineCount = self.lineCount + 1
         self:Line(self.lineCount):SetText(text or "")
+        self:Line(self.lineCount):Show()
         self.rightLines = self.rightLines or {}
         self.rightLines[self.lineCount] = nil
     end
@@ -730,6 +744,7 @@ templates.GameTooltipTemplate = function(frame)
     frame.AddDoubleLine = function(self, left, right)
         self.lineCount = self.lineCount + 1
         self:Line(self.lineCount):SetText(left or "")
+        self:Line(self.lineCount):Show()
         self.rightLines = self.rightLines or {}
         self.rightLines[self.lineCount] = right or ""
     end
@@ -879,6 +894,7 @@ templates.GameTooltipTemplate = function(frame)
 
         for i = 1, table.getn(block) do
             self:Line(i):SetText(block[i])
+            self:Line(i):Show()
         end
         self.lineCount = table.getn(block)
     end
@@ -1570,7 +1586,12 @@ end
      every assertion here is about. ]==]
 Stub.itemFamily = {}
 
-function GetItemFamily(item)
+--[[ Not on a 1.12 client: `GetItemFamily` arrived two expansions later. The
+     stub shipped it anyway, so the bag sorter's quiver handling was exercised
+     through a call the game does not have while the path the game takes --
+     reading the bag's and the item's types -- was never run. Off by default;
+     a test for a later client switches it on. ]]--
+local function stubGetItemFamily(item)
     local id = tonumber(item)
 
     if not id then
@@ -1583,6 +1604,10 @@ function GetItemFamily(item)
     end
 
     return (id and Stub.itemFamily[id]) or 0
+end
+
+function Stub.SetItemFamilyAPI(present)
+    GetItemFamily = present and stubGetItemFamily or nil
 end
 
 function UnitName(unit)
@@ -4231,6 +4256,26 @@ TargetFrameNameBackground = _G["TargetFrame"]:CreateTexture("TargetFrameNameBack
 TargetDeadText = newFontString(_G["TargetFrame"], "OVERLAY", "GameFontNormal")
 _G["TargetDeadText"] = TargetDeadText
 
+--[==[ **The client's combo points on the target frame**, with the cuts the
+     1.12 `TargetFrame.xml` gives them: `UI-ComboPoint` is one 32x16 file,
+     the socket ring in its first 0.375, the red orb to 0.5625, the shine in
+     the rest. Modelled with the real coordinates because the addon reads
+     its own orb's cut off `ComboPoint1Highlight` rather than guessing it --
+     and a stub with no such texture would only ever exercise the guess. ]==]
+CreateFrame("Frame", "ComboFrame", _G["TargetFrame"])
+
+for i = 1, 5 do
+    local point = CreateFrame("Frame", "ComboPoint" .. i, _G["ComboFrame"])
+
+    local highlight = point:CreateTexture("ComboPoint" .. i .. "Highlight", "BACKGROUND")
+    highlight:SetTexture("Interface\\TargetingFrame\\UI-ComboPoint")
+    highlight:SetTexCoord(0.375, 0, 0.375, 1, 0.5625, 0, 0.5625, 1)
+
+    local shine = point:CreateTexture("ComboPoint" .. i .. "Shine", "ARTWORK")
+    shine:SetTexture("Interface\\TargetingFrame\\UI-ComboPoint")
+    shine:SetTexCoord(0.5625, 0, 0.5625, 1, 1, 0, 1, 1)
+end
+
 for i = 1, 4 do
     local name = "PartyMemberFrame" .. i
     local parent = CreateFrame("Frame", name, nil)
@@ -5206,23 +5251,83 @@ Stub.cursor = nil
 Stub.destroyed = {}
 
 function CursorHasItem() return Stub.cursor ~= nil end
-function ClearCursor() Stub.cursor = nil end
+--[[ Putting a lifted item back: its slot unlocks and nothing moved. ]]--
+function ClearCursor()
+    local held = Stub.cursor
+    if held and held.item then held.item.locked = nil end
+    Stub.cursor = nil
+end
 
+--[[ The client's own move rules, which this had wrong. A pickup onto an empty
+     cursor lifts the item and locks its slot. A pickup with something on the
+     cursor is a drop: into an empty slot it lands there; onto the same kind of
+     item it merges up to the stack size; onto a different item the two trade
+     places. In every drop case the cursor is empty afterwards and both slots
+     stay locked until `Stub.SettleBags`, which is the server confirming. ]]--
 function PickupContainerItem(bag, slot)
     local b = Stub.bags[bag]
-    local item = b and b[slot]
+    if not b then return end
 
+    local here = b[slot]
     local held = Stub.cursor
-    Stub.cursor = item
 
-    -- the swap: what was on the cursor lands in the slot it came from
-    if b then b[slot] = held end
+    if not held then
+        if here then
+            here.locked = true
+            Stub.cursor = { item = here, bag = bag, slot = slot }
+        end
+        return
+    end
+
+    local from = Stub.bags[held.bag]
+    local item = held.item
+    Stub.cursor = nil
+
+    if not here then
+        b[slot] = item
+        if from then from[held.slot] = nil end
+    elseif here ~= item and here.name == item.name then
+        local known = Stub.items[Stub.ItemId(item.name)]
+        local max = known and known.maxStack or 1
+        local room = max - (here.count or 1)
+        local moving = item.count or 1
+        if room >= moving then
+            here.count = (here.count or 1) + moving
+            if from then from[held.slot] = nil end
+        else
+            here.count = max
+            item.count = moving - room
+        end
+        here.locked = true
+    elseif here ~= item then
+        b[slot] = item
+        if from then from[held.slot] = here end
+        here.locked = true
+    end
+
+    item.locked = true
+end
+
+--[[ The server confirming every move in flight: every lock clears. ]]--
+function Stub.SettleBags()
+    for _, b in pairs(Stub.bags) do
+        if type(b) == "table" then
+            for _, it in pairs(b) do
+                if type(it) == "table" then it.locked = nil end
+            end
+        end
+    end
 end
 
 function DeleteCursorItem()
     if not Stub.cursor then return end
 
-    table.insert(Stub.destroyed, Stub.cursor.name)
+    local held = Stub.cursor
+    local name = held.name or (held.item and held.item.name)
+    table.insert(Stub.destroyed, name)
+
+    local from = held.bag and Stub.bags[held.bag]
+    if from and held.slot then from[held.slot] = nil end
     Stub.cursor = nil
 end
 

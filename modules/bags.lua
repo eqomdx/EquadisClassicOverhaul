@@ -776,13 +776,61 @@ end
      always ordinary. Zero wherever the client cannot say, which is the safe way
      to be wrong: an unknown bag is treated as a normal one, so nothing is
      refused a move it could have made. ]==]
+--[[ The kinds of special bag 1.12 has, as flags, keyed by the subtype string
+     `GetItemInfo` answers for the bag itself. `GetItemFamily` does not exist
+     on a 1.12 client -- it arrived two expansions later -- so the family has to
+     be read off the item's own type. The flags are this file's own; they only
+     have to agree between a bag and what goes in it. ]]--
+local BAG_KINDS = {
+    ["Quiver"] = 1,
+    ["Ammo Pouch"] = 2,
+    ["Soul Bag"] = 4,
+    ["Herb Bag"] = 8,
+    ["Enchanting Bag"] = 16,
+    ["Engineering Bag"] = 32,
+}
+
+--[[ And what an item is allowed into, by its type and subtype. Anything not
+     listed is an ordinary item and fits an ordinary bag only. ]]--
+local ITEM_KINDS = {
+    ["Projectile/Arrow"] = 1,
+    ["Projectile/Bullet"] = 2,
+    ["Reagent/Reagent"] = 4,
+    ["Trade Goods/Herb"] = 8,
+    ["Trade Goods/Enchanting"] = 16,
+    ["Trade Goods/Parts"] = 32,
+    ["Trade Goods/Devices"] = 32,
+    ["Trade Goods/Explosives"] = 32,
+}
+
+--[[ A soul shard is a reagent, but not every reagent is a soul shard; the name
+     is what tells the soul bag which reagents it takes. ]]--
+local SOUL_SHARD = "Soul Shard"
+
+function M:ItemFamily(link)
+    if not link then return 0 end
+
+    --[[ A later client answers directly. ]]--
+    if type(GetItemFamily) == "function" then
+        return tonumber(GetItemFamily(link)) or 0
+    end
+
+    if type(GetItemInfo) ~= "function" then return 0 end
+
+    local name, _, _, _, class, subclass = GetItemInfo(link)
+    local key = tostring(class or "") .. "/" .. tostring(subclass or "")
+    local family = ITEM_KINDS[key] or 0
+
+    if family == 4 and name ~= SOUL_SHARD then return 0 end
+    return family
+end
+
 function M:BagFamily(id)
     id = tonumber(id)
     if not id or id <= FIRST_BAG then return 0 end
 
     if type(ContainerIDToInventoryID) ~= "function" then return 0 end
     if type(GetInventoryItemLink) ~= "function" then return 0 end
-    if type(GetItemFamily) ~= "function" then return 0 end
 
     local slot = ContainerIDToInventoryID(id)
     if not slot then return 0 end
@@ -790,7 +838,14 @@ function M:BagFamily(id)
     local link = GetInventoryItemLink("player", slot)
     if not link then return 0 end
 
-    return tonumber(GetItemFamily(link)) or 0
+    if type(GetItemFamily) == "function" then
+        return tonumber(GetItemFamily(link)) or 0
+    end
+
+    if type(GetItemInfo) ~= "function" then return 0 end
+
+    local _, _, _, _, _, subclass = GetItemInfo(link)
+    return BAG_KINDS[tostring(subclass or "")] or 0
 end
 
 --[[ Whether a bag is being kept out of the grid. Clicking its button in the
@@ -1598,6 +1653,7 @@ function M:CleanStep()
 
     local rows = self:ScanBags()
     local seen = {}
+    local waiting = false
 
     for i = 1, table.getn(rows) do
         local row = rows[i]
@@ -1633,12 +1689,17 @@ function M:CleanStep()
                     self.sortMoves = (self.sortMoves or 0) + 1
                     return true
                 end
+
+                waiting = true
             end
 
             seen[row.id] = row
         end
     end
 
+    --[[ A pair that could not be merged because one half is still in flight
+         is a pair to come back to, not a bag that is done stacking. ]]--
+    if waiting then return "locked" end
     return false
 end
 
@@ -1790,9 +1851,8 @@ function M:FitsIn(row, family)
     family = tonumber(family) or 0
     if family == 0 then return true end
     if not row or row.empty or not row.link then return true end
-    if type(GetItemFamily) ~= "function" then return true end
 
-    return self:FamilyOverlap(GetItemFamily(row.link), family)
+    return self:FamilyOverlap(self:ItemFamily(row.link), family)
 end
 
 --[==[ **One move towards the order, then look again.**
@@ -1817,8 +1877,11 @@ end
 function M:SortStep()
     if type(PickupContainerItem) ~= "function" then return false end
 
-    --[[ `Sort:Iterate`'s first loop: merge every partial stack it can. ]]--
-    if self:CleanStep() then return true end
+    --[[ `Sort:Iterate`'s first loop: merge every partial stack it can. Stopped
+         by a lock, the whole step waits: ordering around a pile that is about
+         to be merged away would move it and then move it again. ]]--
+    local cleaned = self:CleanStep()
+    if cleaned then return cleaned end
 
     local rows = self:ScanBags()
 
@@ -1886,10 +1949,25 @@ function M:SortStep()
                      misplaced item for another. ]]--
                 if self:SlotLocked(want.bag, want.slot)
                         or self:SlotLocked(goal.bag, goal.slot) then
-                    return false
+                    return "locked"
                 end
 
                 if self:FitsIn(goal, want.eqFamily) then
+                    --[[ The same move asked for twice running means the client
+                         refused it the first time -- a bag it will not put
+                         that item in -- and would refuse it again. Stopping
+                         here is the difference between a sort that gives up
+                         and one that spends four hundred moves not moving. ]]--
+                    local key = want.bag .. ":" .. want.slot .. ">"
+                            .. goal.bag .. ":" .. goal.slot
+
+                    if self.lastMove == key then
+                        self.lastMove = nil
+                        return false
+                    end
+
+                    self.lastMove = key
+
                     --[[ Whatever is on the cursor would be dropped into the
                          first slot touched instead of the item we meant. ]]--
                     if type(ClearCursor) == "function" then ClearCursor() end
@@ -1916,31 +1994,116 @@ end
      both paths -- a bag already in that order was still sorted by something. ]==]
 local SORT_ORDER = "kind, then quality, then item level"
 
+--[==[ **A step has three answers, and the run used to hear two.**
+
+     `SortStep` moved something (`true`), had nothing left to move (`false`), or
+     found the slot it wanted still locked from the previous move -- and it
+     answered that third case with `false` too. The run read `false` as
+     finished. So: one move, the client's `BAG_UPDATE` arrives while the two
+     slots it touched are still locked (it does -- the event comes per bag, and
+     the first one lands before the server has confirmed), the next step meets
+     the lock, and the sort ends with one item moved. Reported as the sort not
+     working at all, which from the front is what one move looks like.
+
+     `"locked"` is the third answer now: keep the run alive and try again on the
+     next event. Bounded, because a lock that never clears would otherwise keep
+     a run open for the rest of the session. ]==]
+local MAX_MOVES = 400
+local MAX_WAITS = 60
+
+--[==[ **The clock drives the run as well as the client's events.**
+
+     Driven by events alone the run stalls. The client's last
+     `ITEM_LOCK_CHANGED` for a move can arrive while `GetContainerItemInfo`
+     still answers locked for the other slot; the step waits for the next
+     event, and there is no next event until the player does something. Two
+     bags tidied and three not -- "working better, but not across all bags",
+     which is what a stall looks like from the front.
+
+     Bagshui restacks on a timer and nothing else -- a move every 0.15 s, half
+     a second when a slot is locked -- and on this client that is the right
+     instrument. The events stay, because they are earlier when they do
+     come; the ticker is what makes sure they are not the only thing. ]==]
+local SORT_TICK = 0.15
+
+function M:SortTicker()
+    if self.ticker then return self.ticker end
+
+    local ticker = CreateFrame("Frame", nil, UIParent)
+    ticker.elapsed = 0
+    ticker:Hide()
+
+    ticker:SetScript("OnUpdate", function()
+        local m = EquadisClassicOverhaul.modules.bags
+
+        if not m or not m.sorting then
+            this:Hide()
+            return
+        end
+
+        this.elapsed = (this.elapsed or 0) + (tonumber(arg1) or 0)
+        if this.elapsed < SORT_TICK then return end
+
+        this.elapsed = 0
+        m:ContinueRun()
+    end)
+
+    self.ticker = ticker
+    return ticker
+end
+
+function M:EndRun()
+    self.sorting = nil
+    if self.ticker then self.ticker:Hide() end
+    return true
+end
+
 function M:Sort()
     self.sorting = true
     self.sortMoves = 0
+    self.sortWaits = 0
+    self.lastMove = nil
 
-    if not self:SortStep() then
-        self.sorting = nil
+    local step = self:SortStep()
+
+    if not step then
+        self:EndRun()
         Say("already tidy -- sorted by " .. SORT_ORDER .. ".")
         return true
     end
+
+    local ticker = self:SortTicker()
+    ticker.elapsed = 0
+    ticker:Show()
 
     Say("tidying up: stacking, then sorting by " .. SORT_ORDER .. ".")
     return true
 end
 
---[==[ The step that keeps a run going, driven by the client telling us a move
-     landed. Bounded, because a pass that cannot make progress must stop rather
-     than issue moves for ever -- and a full pair of bags is a real state in
-     which tidying genuinely cannot finish. ]==]
-local MAX_MOVES = 400
-
+--[[ The step that keeps a run going, driven by the client telling us a move
+     landed -- `BAG_UPDATE` when the contents change, `ITEM_LOCK_CHANGED` when a
+     slot is released, either may be the one that arrives last -- and by the
+     ticker, for when neither does. ]]--
 function M:ContinueRun()
     if not self.sorting then return false end
 
-    if (self.sortMoves or 0) >= MAX_MOVES or not self:SortStep() then
-        self.sorting = nil
+    if (self.sortMoves or 0) >= MAX_MOVES then
+        self:EndRun()
+        return true
+    end
+
+    local step = self:SortStep()
+
+    if step == "locked" then
+        self.sortWaits = (self.sortWaits or 0) + 1
+        if self.sortWaits >= MAX_WAITS then self:EndRun() end
+        return true
+    end
+
+    if step then
+        self.sortWaits = 0
+    else
+        self:EndRun()
     end
 
     return true
@@ -1962,16 +2125,6 @@ function M:Draw()
     local f = self:Frame()
     local cfg = self:Config()
 
-    --[==[ **The border is one of the four styles, and the background is a
-         colour.** Read every redraw, so both take effect while the window is
-         open.
-
-         The style's own insets are kept: on a window they are what hold the
-         fill off the edge art, and the tooltip's edge with a background flush
-         against it is the seam the client never draws. `None` keeps the fill
-         and drops the edge. ]==]
-    self:StyleWindow(f)
-
     local view = self:View()
 
     local columns = tonumber(view == "bank" and cfg.bankColumns or cfg.columns)
@@ -1989,6 +2142,14 @@ function M:Draw()
 
     local width, height = BASE_W, BASE_H
 
+    --[[ Everything below measures from `EDGE`; a deeper border pushes all of
+         it in by the same amount. The close button too, or it sits on the
+         corner ornament. ]]--
+    local inset = self:BorderInset()
+
+    f.close:ClearAllPoints()
+    f.close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6 - inset, -6 - inset)
+
     -- ---- the top row ---------------------------------------------------
 
     for _, b in pairs(f.menu) do b:Hide() end
@@ -2005,7 +2166,7 @@ function M:Draw()
         if last then
             b:SetPoint("TOPLEFT", last, "TOPRIGHT", MENU_GAP, 0)
         else
-            b:SetPoint("TOPLEFT", f, "TOPLEFT", EDGE, -EDGE)
+            b:SetPoint("TOPLEFT", f, "TOPLEFT", EDGE + inset, -EDGE - inset)
         end
 
         --[[ Four of the six are states. A view button lights while you are in
@@ -2037,7 +2198,7 @@ function M:Draw()
         f.title:SetPoint("LEFT", last, "RIGHT", 4, 0)
         width = width + (f.title:GetStringWidth() / 2) + 4
     else
-        f.title:SetPoint("TOPLEFT", f, "TOPLEFT", EDGE, -EDGE - 4)
+        f.title:SetPoint("TOPLEFT", f, "TOPLEFT", EDGE + inset, -EDGE - inset - 4)
         width = width + f.title:GetStringWidth() + EDGE
     end
 
@@ -2072,8 +2233,8 @@ function M:Draw()
          produced -- edge, a menu button, a gap; then a strip and a gap when
          there is one -- with nothing to hang off. Every case the old chain
          had (row or no row, strip or no strip) lands on the same pixel. ]==]
-    local nextTop = EDGE + ROW_GAP
-    if last then nextTop = EDGE + MENU + ROW_GAP end
+    local nextTop = EDGE + inset + ROW_GAP
+    if last then nextTop = EDGE + inset + MENU + ROW_GAP end
 
     --[[ The strip is drawn under the grid now -- see the foot, below. ]]--
 
@@ -2223,8 +2384,18 @@ function M:Draw()
 
     if width < MIN_BODY then width = MIN_BODY end
 
-    f:SetWidth(width + FRAME_PAD)
-    f:SetHeight(height)
+    f:SetWidth(width + FRAME_PAD + (inset * 2))
+    f:SetHeight(height + (inset * 2))
+
+    --[==[ **The border is one of the four styles, and the background is a
+         colour.** Read every redraw, so both take effect while the window is
+         open -- and applied *after* the window has its size, because
+         `OB.BorderEdge` narrows the edge to fit the frame it is asked about.
+         Asked before the resize it measured the 36-pixel placeholder and
+         narrowed the Blizzard edge to fit that, for the one draw until the
+         next redraw put it right. `None` keeps the fill and drops the
+         edge. ]==]
+    self:StyleWindow(f)
 
     return true
 end
@@ -2663,40 +2834,105 @@ end
      A bank drawn from memory looks exactly like a bank drawn from the bank, and
      the difference matters: one of them is what is there and the other is what
      was there when you last stood at it. ]==]
---[[ The window's own backdrop: the chosen edge over the chosen ground. ]]--
+--[==[ **The content never sits on the ornament now, so it never has to
+     move for it.**
+
+     It did: the Blizzard edge was drawn *on* the window, inward from its
+     boundary, so the ornament lay over the first eleven pixels of the fill
+     and everything inside was pushed in to clear it, and the window grown to
+     pay for that. With the edge hung outside the window -- see `StyleWindow`
+     -- the ornament frames the fill instead of covering it, and `EDGE` is the
+     whole of the margin again. Kept as a function because the layout asks
+     it in eight places, and an answer of nought is the cheapest change to
+     eight places there is. ]==]
+function M:BorderInset()
+    return 0
+end
+
+--[==[ **The fill on the window and the edge on a frame of its own, hung
+     `outset` outside it** -- the way the cast bar and the tooltip wear theirs,
+     and for the same fault.
+
+     Both were on one backdrop. A backdrop draws its edge inward from the
+     frame's boundary, and where the ink sits in that band is the art's own
+     business: the Thin line is the outermost pixel, the Classic tooltip
+     edge's ink runs from the second pixel to the fifth, the Blizzard
+     ornament from the fourth to the fourteenth. The fill, meanwhile, stops
+     wherever `insets` say. So Thin left a transparent pixel between line
+     and fill, Classic had the fill running out under the edge and showing
+     through its transparent first column -- the leak the cast bar was fixed
+     for -- and Blizzard's fill and ornament overlapped by two.
+
+     `outset` is where the ink's inner end is, measured off the files
+     (`OB.borderEdges`). A border frame hung that far outside the window
+     lands the ink against the fill's boundary: no gap, no leak, and nothing
+     of the window under the ornament. The fill is flush to the frame with
+     no insets at all, because the frame's edge *is* where the fill should
+     stop. ]==]
 function M:StyleWindow(f)
     local cfg = self:Config()
     local look = OB.Look("bags")
     local ground = cfg.color or { 0, 0, 0, 0.5 }
 
-    local edge = OB.BorderEdge(tonumber(look.border) or 2,
-            f:GetWidth(), f:GetHeight())
-
-    local backdrop = {
-        bgFile = OB.backdrop and OB.backdrop.bgFile
-                or "Interface\\Buttons\\WHITE8X8",
-        tile = false,
-    }
-
-    if edge then
-        backdrop.edgeFile = edge.edgeFile
-        backdrop.edgeSize = edge.edgeSize
-        backdrop.insets = edge.insets or { left = 0, right = 0, top = 0, bottom = 0 }
-    else
-        backdrop.insets = { left = 0, right = 0, top = 0, bottom = 0 }
-    end
-
-    --[[ Only when it changed: `SetBackdrop` rebuilds nine textures. ]]--
-    local key = tostring(backdrop.edgeFile) .. ":" .. tostring(backdrop.edgeSize)
-
-    if f.ecoBackdropKey ~= key then
-        f:SetBackdrop(backdrop)
-        f.ecoBackdropKey = key
+    if not f.ecoGround then
+        f:SetBackdrop({
+            bgFile = OB.backdrop and OB.backdrop.bgFile
+                    or "Interface\\Buttons\\WHITE8X8",
+            tile = false,
+            insets = { left = 0, right = 0, top = 0, bottom = 0 },
+        })
+        f.ecoGround = true
     end
 
     f:SetBackdropColor(ground[1] or 0, ground[2] or 0, ground[3] or 0,
             ground[4] or 0.5)
-    f:SetBackdropBorderColor(1, 1, 1, 1)
+
+    if not f.border then
+        f.border = CreateFrame("Frame", nil, f)
+    end
+
+    local border = f.border
+    local edge = OB.BorderEdge(tonumber(look.border) or 2,
+            f:GetWidth(), f:GetHeight())
+
+    if not edge or not edge.edgeFile then
+        border:SetBackdrop(nil)
+        border:Hide()
+        border.ecoKey = nil
+        return true
+    end
+
+    local size = tonumber(edge.edgeSize) or 8
+    local pad = math.floor(tonumber(edge.outset) or (size / 2))
+    if pad < 1 then pad = 1 end
+
+    border:ClearAllPoints()
+    border:SetPoint("TOPLEFT", f, "TOPLEFT", -pad, pad)
+    border:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", pad, -pad)
+
+    --[[ Only when it changed: `SetBackdrop` rebuilds nine textures. Only the
+         edge, and no insets: there is no background on this frame for them
+         to hold off anything. ]]--
+    local key = tostring(edge.edgeFile) .. ":" .. tostring(size)
+
+    if border.ecoKey ~= key then
+        border:SetBackdrop({
+            edgeFile = edge.edgeFile,
+            edgeSize = size,
+            insets = { left = 0, right = 0, top = 0, bottom = 0 },
+        })
+        border.ecoKey = key
+    end
+
+    --[[ Level re-asserted every pass, as the cast bar does: the ink is
+         outside the window and covers nothing, and the band inside it is
+         transparent, so it only has to be above the fill. ]]--
+    if border.SetFrameLevel and f.GetFrameLevel then
+        border:SetFrameLevel((f:GetFrameLevel() or 0) + 1)
+    end
+
+    border:SetBackdropBorderColor(1, 1, 1, 1)
+    border:Show()
 
     return true
 end
@@ -2751,8 +2987,11 @@ function M:OnEvent()
         self:RememberBags()
     end
 
-    --[[ A move landing is what drives the next one. ]]--
-    if event == "BAG_UPDATE" then self:ContinueRun() end
+    --[[ A move landing is what drives the next one -- and a lock clearing is
+         the other half of a move landing. ]]--
+    if event == "BAG_UPDATE" or event == "ITEM_LOCK_CHANGED" then
+        self:ContinueRun()
+    end
 
     self:Refresh()
 end

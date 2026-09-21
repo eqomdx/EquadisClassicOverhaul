@@ -637,33 +637,31 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
     end
 
     msg = string.gsub(msg or "", "^%s*(.-)%s*$", "%1")
-
-    local _, _, verb, rest = string.find(msg, "^(%S*)%s*(.*)$")
-    verb = string.lower(verb or "")
-    rest = rest or ""
+    local word = string.lower(msg)
 
     local function tell(line) OB.Raw("   " .. line) end
 
-    --[[ **Bare `/chatscan` says what it is for and then what it takes.**
+    --[==[ **Three shapes, and the bare command is the first of them.**
 
-         It used to start a scan, which is a strange thing for a bare command to
-         do: the one you type by accident is the one that should explain itself,
-         not the one that begins several hundred server queries. `start` is now
-         the word that starts it, and it costs one word to say. ]]--
-    if verb == "" or verb == "help" or verb == "?" then
+         `/chatscan` starts the whole sweep, `/chatscan stop` ends it, and
+         `/chatscan 34` or `/chatscan 50-60` scan a level or a range. That is
+         the set asked for, and `start` is gone from all of them: the word
+         said nothing the command did not already say. A class name still
+         works in the same place a level does, and `help` says all this. ]==]
+    if word == "help" or word == "?" then
         local what = "progressively scans the /who list and puts what it learns"
                 .. " -- level, class, guild -- against the names in your chat."
         OB.Print(what, "ChatScan")
 
-        tell("|cffffd100/chatscan start|r  everybody, level by level")
-        tell("|cffffd100/chatscan start 34|r  one level")
-        tell("|cffffd100/chatscan start 50-60|r  a range of levels")
-        tell("|cffffd100/chatscan start mage|r  one class, in bands of ten")
+        tell("|cffffd100/chatscan|r  everybody, level by level")
+        tell("|cffffd100/chatscan 34|r  one level")
+        tell("|cffffd100/chatscan 50-60|r  a range of levels")
+        tell("|cffffd100/chatscan mage|r  one class, in bands of ten")
         tell("|cffffd100/chatscan stop|r  stop the one that is running")
         return
     end
 
-    if verb == "stop" then
+    if word == "stop" then
         if not roster:Sweeping() then
             OB.Print("nothing is running.", "ChatScan")
             return
@@ -673,13 +671,11 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
         return
     end
 
-    if verb ~= "start" then
-        OB.Print("no such command -- '/chatscan' on its own lists them.",
-                "ChatScan")
-        return
-    end
+    --[[ The old spelling, quietly: `/chatscan start 34` is `/chatscan 34`. ]]--
+    local _, _, after = string.find(word, "^start%s*(.*)$")
+    if after then word = after end
 
-    --[[ One scan at a time. The queue is one list and a second `start` would
+    --[[ One scan at a time. The queue is one list and a second start would
          throw away whatever the first had left to do, silently. ]]--
     if roster:Sweeping() then
         OB.Print("a scan is already running -- '/chatscan stop' first.",
@@ -687,7 +683,7 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
         return
     end
 
-    if rest == "" then
+    if word == "" then
         roster:SetScanning(true)
         return
     end
@@ -695,7 +691,7 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
     --[[ **A range before a single level**, because `50-60` also matches the
          number pattern at its first character and would otherwise be read as
          level fifty with some rubbish after it. ]]--
-    local _, _, low, high = string.find(rest, "^(%d+)%s*%-%s*(%d+)$")
+    local _, _, low, high = string.find(word, "^(%d+)%s*%-%s*(%d+)$")
 
     if low then
         local queued = roster:StartRangeScan(low, high)
@@ -709,7 +705,7 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
         return
     end
 
-    local level = tonumber(rest)
+    local level = tonumber(word)
 
     if level then
         if level < 1 or level > 60 or level ~= math.floor(level) then
@@ -725,11 +721,11 @@ SlashCmdList["EQUADISOVERHAULCHATSCAN"] = function(msg)
          thing this takes -- so an unknown word is answered as an unknown class
          rather than as a syntax error, because that is what it almost always
          is. ]]--
-    local class = roster:ClassNamed(rest)
+    local class = roster:ClassNamed(word)
 
     if not class then
-        local unknown = "'" .. rest .. "' is not a level or a class -- "
-                .. "'/chatscan' on its own lists what this takes."
+        local unknown = "'" .. msg .. "' is not a level or a class -- "
+                .. "'/chatscan help' lists what this takes."
         OB.Print(unknown, "ChatScan")
         return
     end

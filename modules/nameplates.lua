@@ -460,7 +460,12 @@ local M = OB.RegisterModule({
         tankLoseAt = 80,
 
         showCombo = false,
-        comboColor = { 1.00, 0.85, 0.20, 1 },
+
+        --[[ The height of one point; the width follows the art's own
+             three-to-four. Twelve, because sixteen -- the target frame's --
+             is a row wider than a narrow plate. A stored `comboColor` is
+             ignored: the orb is the client's red. ]]--
+        comboSize = 12,
 
         castbar = true,
         castTargetOnly = false,
@@ -682,8 +687,8 @@ local M = OB.RegisterModule({
           nil, nil, "@plates_dps_mode" },
         { "Show Combo Points On Target", "showCombo", "boolean",
           nil, nil, nil, nil, nil, "@plates_no_combo" },
-        { "Combo Point Color", "comboColor", "color", true,
-          nil, nil, nil, nil, "!showCombo" },
+        { "Combo Point Size", "comboSize", "slider", 8, 20, 1,
+          nil, nil, "!showCombo" },
 
         { "Casting", "__s_cast", "section", "cast" },
         { "Show Cast Bars", "castbar", "boolean" },
@@ -1084,6 +1089,37 @@ function M:ResetPlateIdentity(plate)
     end
 end
 
+--[[ The cut of `UI-ComboPoint` the target frame uses -- ring, orb -- read
+     off the client's own `ComboPoint1Highlight` where it has built one, with
+     the 1.12 numbers standing in on a client that has not. Answered once;
+     `force` reads again. ]]--
+local COMBO_ART = "Interface\\TargetingFrame\\UI-ComboPoint"
+local comboArtCache
+
+local function comboArt(force)
+    if comboArtCache and not force then return comboArtCache end
+
+    local art = { file = COMBO_ART, ring = { 0, 0.375, 0, 1 },
+                  orb = { 0.375, 0.5625, 0, 1 } }
+
+    local t = getglobal("ComboPoint1Highlight")
+    if t and type(t.GetTexCoord) == "function" then
+        local ulx, uly, llx, lly, urx = t:GetTexCoord()
+
+        if type(ulx) == "number" and type(urx) == "number" then
+            art.orb = { ulx, urx, uly or 0, lly or 1 }
+
+            local file = t.GetTexture and t:GetTexture()
+            if type(file) == "string" then art.file = file end
+        end
+    end
+
+    comboArtCache = art
+    return art
+end
+
+function M:ComboArt(force) return comboArt(force) end
+
 function M:Adopt(frame)
     local plate = {
         frame = frame,
@@ -1231,10 +1267,28 @@ function M:Adopt(frame)
         plate.debuffTimers[i] = timer
     end
 
+    --[==[ **The client's own combo points**, cut from the art the target
+         frame draws them with. `UI-ComboPoint` is one 32x16 file: the socket
+         ring in its first 0.375, the red orb to 0.5625, the shine in the
+         rest. Each earned point here is a lit socket -- ring over orb, as the
+         target frame stacks them -- and an unearned one is nothing, which is
+         what the six-pixel squares did and what a plate has room for. The
+         orb's cut is read off `ComboPoint1Highlight` where the client has
+         built it, so it is the same red circle the target frame lights. ]==]
+    local art = comboArt()
+
+    plate.comboOrbs = {}
+
     for i = 1, 5 do
+        local orb = plate.overlay:CreateTexture(nil, "OVERLAY")
+        orb:SetTexture(art.file)
+        orb:SetTexCoord(art.orb[1], art.orb[2], art.orb[3], art.orb[4])
+        orb:Hide()
+        plate.comboOrbs[i] = orb
+
         local point = plate.overlay:CreateTexture(nil, "OVERLAY")
-        point:SetWidth(6)
-        point:SetHeight(6)
+        point:SetTexture(art.file)
+        point:SetTexCoord(art.ring[1], art.ring[2], art.ring[3], art.ring[4])
         point:Hide()
         plate.combo[i] = point
     end
@@ -1550,10 +1604,26 @@ function M:Style(plate)
 
     self:PositionDebuffs(plate)
 
+    --[[ Under the bar's right end and growing leftward, which is the way the
+         target frame fills its own row. The art is 12x16 and the orb 8 wide
+         inside it; both scale with the size. ]]--
+    local size = tonumber(cfg.comboSize) or 12
+    if size < 4 then size = 4 end
+
+    local w = floor((size * 12 / 16) + 0.5)
+    local orbW = floor((size * 8 / 16) + 0.5)
+
     for i = 1, 5 do
+        plate.combo[i]:SetWidth(w)
+        plate.combo[i]:SetHeight(size)
         plate.combo[i]:ClearAllPoints()
         plate.combo[i]:SetPoint("TOPRIGHT", plate.health, "BOTTOMRIGHT",
-                -((i - 1) * 8), -2)
+                -((i - 1) * (w + 1)), -2)
+
+        plate.comboOrbs[i]:SetWidth(orbW)
+        plate.comboOrbs[i]:SetHeight(size)
+        plate.comboOrbs[i]:ClearAllPoints()
+        plate.comboOrbs[i]:SetPoint("CENTER", plate.combo[i], "CENTER", 0, 0)
     end
 
     if plate.raidicon then
@@ -3402,11 +3472,11 @@ function M:Refresh(plate)
     if plate.istarget and cfg.showCombo then points = self:ComboPoints() end
     for i = 1, 5 do
         if i <= points then
-            plate.combo[i]:SetTexture(cfg.comboColor[1], cfg.comboColor[2],
-                    cfg.comboColor[3], cfg.comboColor[4] or 1)
             plate.combo[i]:Show()
+            plate.comboOrbs[i]:Show()
         else
             plate.combo[i]:Hide()
+            plate.comboOrbs[i]:Hide()
         end
     end
 end

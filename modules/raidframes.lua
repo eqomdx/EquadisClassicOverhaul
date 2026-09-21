@@ -500,10 +500,13 @@ function M:Button(index)
     button.leader:SetHeight(12)
     button.leader:Hide()
 
+    --[[ The same size as the crown, which is how the client draws the pair
+         on its own party frames: a bag one pixel smaller sat half a pixel
+         off the crown's line. ]]--
     button.looter = button.health:CreateTexture(nil, "OVERLAY")
     button.looter:SetTexture("Interface\\GroupFrame\\UI-Group-MasterLooter")
-    button.looter:SetWidth(11)
-    button.looter:SetHeight(11)
+    button.looter:SetWidth(12)
+    button.looter:SetHeight(12)
     button.looter:Hide()
 
     button.status = OB.NewText(button.health, "OVERLAY", "GameFontNormalSmall")
@@ -630,6 +633,53 @@ end
      whole button; the leader loses room for one; the one person holding the loot
      as well loses room for two. ]==]
 local BADGE_ROOM = 13
+
+--[==[ **Both badges on the right, the bag inboard of the crown, and each
+     against the one before it that is shown.**
+
+     The name runs from the left, so the right-hand end is the side with room.
+     The crown is outermost because somebody has it for the whole raid, while
+     master loot is a method that gets switched on and off -- the badge that
+     comes and goes should be the one that moves nothing when it does.
+
+     The bag used to hang off the crown's left whether or not the crown was
+     there. A hidden texture keeps its rectangle, so on a master looter who is
+     not the leader the bag sat a crown's width in from the edge with nothing
+     beside it -- "slightly offset", which is exactly what it was. The state
+     word was worse: anchored to the bar's edge under whichever badge was
+     there. Right to left now, and every anchor is something on screen. ]==]
+local function shown(region)
+    return region and region.IsShown and region:IsShown()
+end
+
+function M:PlaceBadges(button)
+    if not button or not button.health then return false end
+
+    local anchor, edge, gap = button.health, "RIGHT", -1
+
+    local function place(region)
+        if not region then return end
+        region:ClearAllPoints()
+
+        if shown(region) then
+            region:SetPoint("RIGHT", anchor, edge, gap, 0)
+            anchor, edge, gap = region, "LEFT", -1
+        else
+            region:SetPoint("RIGHT", button.health, "RIGHT", -1, 0)
+        end
+    end
+
+    place(button.leader)
+    place(button.looter)
+
+    if button.status then
+        button.status:ClearAllPoints()
+        button.status:SetPoint("RIGHT", anchor, edge,
+                (anchor == button.health) and -2 or -STATUS_AIR, 0)
+    end
+
+    return true
+end
 
 function M:SizeName(button, width)
     if not button or not button.name or not button.name.SetWidth then return false end
@@ -807,8 +857,6 @@ function M:Layout()
         button.name:SetWidth(width - 4)
 
         --[[ On the right, and the name gives it room -- see `SizeName`. ]]--
-        button.status:ClearAllPoints()
-        button.status:SetPoint("RIGHT", button.health, "RIGHT", -2, 0)
         button.status:SetJustifyH("RIGHT")
 
         --[[ No width: a font string with one is a box, and a box narrower than
@@ -816,18 +864,10 @@ function M:Layout()
              gives it whatever it measures. ]]--
         button.status:SetWidth(0)
 
-        --[==[ **Both badges on the right, and the bag inboard of the crown.**
-
-         The name runs from the left, so the right-hand end is the side with
-         room. The crown is outermost because somebody has it for the whole raid,
-         while master loot is a method that gets switched on and off -- the badge
-         that comes and goes should be the one that moves nothing when it
-         does. ]==]
-        button.leader:ClearAllPoints()
-        button.leader:SetPoint("RIGHT", button.health, "RIGHT", -1, 0)
-
-        button.looter:ClearAllPoints()
-        button.looter:SetPoint("RIGHT", button.leader, "LEFT", -1, 0)
+        --[[ The badges and the state word, placed against what is shown --
+             see `PlaceBadges`, which `UpdateButton` runs again once it knows
+             who has what. ]]--
+        self:PlaceBadges(button)
 
         --[[ Sized in `UpdateButton`, where it is known whether this particular
              button has any badges on it -- see `SizeName`. ]]--
@@ -1092,7 +1132,8 @@ function M:UpdateButton(index)
     end
 
     --[[ After the badges and the status, because their visibility is what
-         decides how much room the name has. ]]--
+         decides where each sits and how much room the name has. ]]--
+    self:PlaceBadges(button)
     self:SizeName(button)
 
     button.health:SetStatusBarColor(r, g, b, 1)

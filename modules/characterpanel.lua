@@ -87,9 +87,10 @@ local M = OB.RegisterModule({
 
         --[[ The client's small face is ten, and beside BetterCharacterStats'
              eleven-point Myriad it reads a size or two large -- Friz Quadrata
-             is a wide face. Nine by default, and a slider because "too big"
-             is a judgement about a screen this addon cannot see. ]]--
-        statFontSize = 9,
+             is a wide face. Nine was still "too high"; eight by default, and
+             a slider because "too big" is a judgement about a screen this
+             addon cannot see. Schema 44 moves a shipped nine down. ]]--
+        statFontSize = 8,
 
         --[[ Which group each pane opens on. Base beside melee, which answers
              "what am I" and "what do I hit for" at the same time. ]]--
@@ -134,7 +135,7 @@ local M = OB.RegisterModule({
 
         { "Stats", "__s_stats", "section", "stats" },
         { "Show The Stat Panes", "statPanes", "boolean" },
-        { "Stat Text Size", "statFontSize", "slider", 7, 12, 1,
+        { "Stat Text Size", "statFontSize", "slider", 6, 12, 1,
           nil, nil, "!statPanes" },
         { "Left Pane", "leftGroup",
           OB.Enum({ "base", "melee", "ranged", "defense" },
@@ -285,7 +286,31 @@ local SCHOOLS = { "Arcane", "Fire", "Frost", "Holy", "Nature", "Shadow" }
      one is counted once per set, keyed on the set's name -- the "Name (3/8)"
      line above the list -- and the bonus text, so two different sets that
      happen to grant the same thing are still both counted. ]==]
-local function readGearLine(line, out, setName)
+--[==[ **How many lines the tooltip holds right now**, and not one more.
+
+     The client reuses one pool of font strings for every tooltip and
+     `ClearLines` hides them without blanking them, so after a long tooltip a
+     short one leaves the long one's tail readable past `NumLines()`. The
+     three scans here walked to the first nil, which in game is never the
+     end of *this* tooltip: bracers with a hit line followed by plain gloves
+     counted the bracers' hit twice, and Precision's own sentence sat under
+     every shorter talent read after it. That is the "hit isn't counting
+     properly" that survived two rounds of pattern work -- the patterns were
+     right and the lines were somebody else's.
+
+     Capped for a client whose count cannot be trusted, and the cap is the
+     old ceiling. ]==]
+local SCAN_CAP = 40
+
+local function scanCount(tip)
+    local n = tip and tip.NumLines and tip:NumLines()
+    if type(n) ~= "number" or n > SCAN_CAP then return SCAN_CAP end
+    return n
+end
+
+--[[ `trace`, when given, collects what was read and from where, for the
+     debug command: a wrong total is settled by the lines behind it. ]]--
+local function readGearLine(line, out, setName, trace)
     if string.find(line, "^%(%d+%) Set:") then return false end
 
     if string.find(line, "^Set:") then
@@ -307,6 +332,10 @@ local function readGearLine(line, out, setName)
                 out.spellHit = (out.spellHit or 0) + value
             else
                 out[key] = (out[key] or 0) + value
+            end
+
+            if trace then
+                table.insert(trace, { key = key, value = value, line = line })
             end
             return true
         end
@@ -344,7 +373,8 @@ function M:GearBonuses(force)
 
     local out = { hit = 0, crit = 0, spellHit = 0, spellCrit = 0,
                   rangedHit = 0,
-                  spellPower = 0, healing = 0, schools = {}, read = false }
+                  spellPower = 0, healing = 0, schools = {}, read = false,
+                  trace = {} }
 
     for i = 1, table.getn(SCHOOLS) do out.schools[SCHOOLS[i]] = 0 end
 
@@ -361,19 +391,24 @@ function M:GearBonuses(force)
                 if tip.ClearLines then tip:ClearLines() end
                 tip:SetInventoryItem("player", slot)
 
-                local index = 1
-                local line = OB.ScanLine(index)
                 local setName
+                local before = table.getn(out.trace)
 
-                while line and index < 40 do
+                for index = 1, scanCount(tip) do
+                    local line = OB.ScanLine(index)
+                    if not line then break end
+
                     --[[ "Bloodfang Armor (3/8)": the line that names the set
                          its bonuses belong to, read before they are. ]]--
                     local _, _, named = string.find(line, "^(.+) %(%d+/%d+%)$")
                     if named then setName = named end
 
-                    readGearLine(line, out, setName)
-                    index = index + 1
-                    line = OB.ScanLine(index)
+                    readGearLine(line, out, setName, out.trace)
+                end
+
+                for t = before + 1, table.getn(out.trace) do
+                    out.trace[t].slot = slot
+                    out.trace[t].item = OB.ScanLine(1)
                 end
             end
         end
@@ -417,7 +452,7 @@ local TALENT_LINES = {
     { "Increases your critical strike chance with ranged weapons by (%d+%.?%d*)%%", "rangedCrit" },
 }
 
-local function readTalentLine(line, out)
+local function readTalentLine(line, out, talent)
     for i = 1, table.getn(TALENT_LINES) do
         local _, _, found = string.find(line, TALENT_LINES[i][1])
 
@@ -434,6 +469,9 @@ local function readTalentLine(line, out)
             else
                 out[key] = (out[key] or 0) + value
             end
+
+            table.insert(out.trace, { key = key, value = value,
+                                      line = line, talent = talent })
             return true
         end
     end
@@ -451,7 +489,8 @@ function M:TalentBonuses(force)
         return self.talents
     end
 
-    local out = { hit = 0, crit = 0, spellHit = 0, rangedCrit = 0, read = false }
+    local out = { hit = 0, crit = 0, spellHit = 0, rangedCrit = 0, read = false,
+                  trace = {} }
 
     local tip = type(OB.ScanTooltip) == "function" and OB.ScanTooltip()
     local nextRank = TOOLTIP_TALENT_NEXT_RANK or "Next rank:"
@@ -470,16 +509,15 @@ function M:TalentBonuses(force)
                     if tip.ClearLines then tip:ClearLines() end
                     tip:SetTalent(tab, index)
 
-                    local i = 1
-                    local line = OB.ScanLine(i)
+                    local talent = OB.ScanLine(1)
 
-                    while line and i < 40 do
-                        if line == nextRank or string.find(line, "^Next rank") then
+                    for i = 1, scanCount(tip) do
+                        local line = OB.ScanLine(i)
+                        if not line or line == nextRank
+                                or string.find(line, "^Next rank") then
                             break
                         end
-                        readTalentLine(line, out)
-                        i = i + 1
-                        line = OB.ScanLine(i)
+                        readTalentLine(line, out, talent)
                     end
                 end
             end
@@ -514,7 +552,7 @@ function M:SpellbookCrit()
             if tip.ClearLines then tip:ClearLines() end
             tip:SetSpell(i, BOOKTYPE_SPELL or "spell")
 
-            for l = 1, 20 do
+            for l = 1, scanCount(tip) do
                 local line = OB.ScanLine(l)
                 if not line then break end
 
@@ -530,8 +568,88 @@ function M:SpellbookCrit()
     return nil
 end
 
+-- ---------------------------------------------------------------------------
+-- what the buffs say
+-- ---------------------------------------------------------------------------
+
+--[==[ **Hit from what is on you right now**, which is neither gear nor a
+     talent and is still the chance to hit. A food that grants hit is hit
+     while it lasts; a swarm of insects takes hit away while it lasts. Both
+     are on the buff tooltips in a few sentences, the same ones
+     BetterCharacterStats reads, and nothing looser is matched. ]==]
+local AURA_LINES = {
+    { "Chance to hit increased by (%d+%.?%d*)%%", "hit" },
+    { "Improves your chance to hit by (%d+%.?%d*)%%", "hit" },
+    { "Increases attack power by %d+ and chance to hit by (%d+%.?%d*)%%", "hit" },
+    { "Chance to hit reduced by (%d+%.?%d*)%%", "hitDebuff" },
+    { "Chance to hit decreased by (%d+%.?%d*)%%", "hitDebuff" },
+}
+
+local BUFF_SLOTS, DEBUFF_SLOTS = 32, 16
+
+local function readAuraLine(line, out, aura)
+    for i = 1, table.getn(AURA_LINES) do
+        local _, _, found = string.find(line, AURA_LINES[i][1])
+
+        if found then
+            local key = AURA_LINES[i][2]
+            local value = tonumber(found) or 0
+
+            out[key] = (out[key] or 0) + value
+            table.insert(out.trace, { key = key, value = value,
+                                      line = line, aura = aura })
+            return true
+        end
+    end
+
+    return false
+end
+
+function M:AuraBonuses(force)
+    local now = (type(GetTime) == "function" and GetTime()) or 0
+
+    if not force and self.auras and (now - (self.aurasAt or -1)) < 0.5 then
+        return self.auras
+    end
+
+    local out = { hit = 0, hitDebuff = 0, read = false, trace = {} }
+
+    local tip = type(OB.ScanTooltip) == "function" and OB.ScanTooltip()
+
+    if tip and tip.SetPlayerBuff and type(GetPlayerBuff) == "function"
+            and type(OB.ScanLine) == "function" then
+        out.read = true
+
+        local passes = { { "HELPFUL", BUFF_SLOTS }, { "HARMFUL", DEBUFF_SLOTS } }
+
+        for p = 1, 2 do
+            local filter, slots = passes[p][1], passes[p][2]
+
+            for position = 0, slots - 1 do
+                local index = GetPlayerBuff(position, filter)
+                if type(index) ~= "number" or index < 0 then break end
+
+                if tip.ClearLines then tip:ClearLines() end
+                tip:SetPlayerBuff(index)
+
+                local aura = OB.ScanLine(1)
+
+                for i = 1, scanCount(tip) do
+                    local line = OB.ScanLine(i)
+                    if not line then break end
+                    readAuraLine(line, out, aura)
+                end
+            end
+        end
+    end
+
+    self.auras, self.aurasAt = out, now
+    return out
+end
+
 --[[ Gear plus talents where both scans ran, gear alone where only that one
-     did, nothing where neither could. ]]--
+     did, nothing where neither could. Melee and ranged hit take the buffs
+     on top and the debuffs off, and never go below nothing. ]]--
 local function hitTotal(gearKey, talentKey)
     local gear = M:GearBonuses()
     if not gear or not gear.read then return nil end
@@ -540,7 +658,125 @@ local function hitTotal(gearKey, talentKey)
     local talents = M:TalentBonuses()
     if talents and talents.read then total = total + (talents[talentKey] or 0) end
 
+    if gearKey == "hit" then
+        local auras = M:AuraBonuses()
+        if auras and auras.read then
+            total = total + (auras.hit or 0) - (auras.hitDebuff or 0)
+        end
+        if total < 0 then total = 0 end
+    end
+
     return total
+end
+
+-- ---------------------------------------------------------------------------
+-- where a number came from
+-- ---------------------------------------------------------------------------
+
+--[[ Each contribution the scans traced, as a line, for the keys asked. ]]--
+local function tracedLines(lines, list, keys, from)
+    for i = 1, table.getn(list or {}) do
+        local t = list[i]
+
+        if keys[t.key] then
+            local sign = (t.key == "hitDebuff") and "-" or "+"
+            table.insert(lines, "  " .. from(t) .. ": " .. sign .. tostring(t.value) .. "%")
+        end
+    end
+end
+
+local function itemName(t) return tostring(t.item) end
+local function talentName(t) return tostring(t.talent) end
+local function auraName(t) return tostring(t.aura) end
+
+--[[ Gear, talents and buffs, each with the lines behind it. `ranged` adds
+     the scope. ]]--
+local function explainHit(ranged)
+    return function()
+        local lines = {}
+        local keys = { hit = true, both = true }
+        if ranged then keys.rangedHit = true end
+
+        local gear = M:GearBonuses()
+        if gear and gear.read then
+            local total = (gear.hit or 0) + (ranged and (gear.rangedHit or 0) or 0)
+            table.insert(lines, "Gear: " .. statPercent(total))
+            tracedLines(lines, gear.trace, keys, itemName)
+        else
+            table.insert(lines, "Gear: could not be read on this client")
+        end
+
+        local talents = M:TalentBonuses()
+        if talents and talents.read then
+            table.insert(lines, "Talents: " .. statPercent(talents.hit or 0))
+            tracedLines(lines, talents.trace, { hit = true, both = true }, talentName)
+        else
+            table.insert(lines, "Talents: could not be read on this client")
+        end
+
+        local auras = M:AuraBonuses()
+        if auras and auras.read and ((auras.hit or 0) > 0 or (auras.hitDebuff or 0) > 0) then
+            table.insert(lines, "Buffs: "
+                    .. statPercent((auras.hit or 0) - (auras.hitDebuff or 0)))
+            tracedLines(lines, auras.trace, { hit = true, hitDebuff = true }, auraName)
+        end
+
+        return lines
+    end
+end
+
+--[[ One gear total by key -- the spell page's hit and crit. ]]--
+local function explainGear(key)
+    return function()
+        local lines = {}
+        local gear = M:GearBonuses()
+
+        if gear and gear.read then
+            table.insert(lines, "Gear: " .. statPercent(gear[key] or 0))
+            tracedLines(lines, gear.trace, { [key] = true, both = (key == "spellHit") or nil },
+                    itemName)
+        else
+            table.insert(lines, "Gear: could not be read on this client")
+        end
+
+        return lines
+    end
+end
+
+--[[ Crit: whichever answered -- the client, the Attack tooltip, or the sum
+     of agility, gear and talents. ]]--
+local function explainCrit()
+    local lines = {}
+
+    local crit = ask("GetCritChance")
+    if type(crit) ~= "number" then crit = ask("GetMeleeCritChance") end
+    if type(crit) == "number" then
+        table.insert(lines, "From the client's own crit call")
+        return lines
+    end
+
+    local book = M:SpellbookCrit()
+    if type(book) == "number" then
+        table.insert(lines, "From the Attack tooltip, which is the whole number")
+        return lines
+    end
+
+    local agility = M:CritFromAgility()
+    table.insert(lines, "Agility: " .. (agility and statPercent(agility) or "no constants for this class"))
+
+    local gear = M:GearBonuses()
+    if gear and gear.read then
+        table.insert(lines, "Gear: " .. statPercent(gear.crit or 0))
+        tracedLines(lines, gear.trace, { crit = true }, itemName)
+    end
+
+    local talents = M:TalentBonuses()
+    if talents and talents.read then
+        table.insert(lines, "Talents: " .. statPercent(talents.crit or 0))
+        tracedLines(lines, talents.trace, { crit = true, critAll = true }, talentName)
+    end
+
+    return lines
 end
 
 --[==[ **Crit is mostly agility, and this sheet was showing only the gear.**
@@ -659,8 +895,10 @@ end
 function M:BossMiss(skill, dual)
     if type(skill) ~= "number" then return nil end
 
-    local gear = self:GearBonuses()
-    local hit = (gear and gear.read and gear.hit) or 0
+    --[[ The whole of hit -- gear, talents, buffs -- and not the gear alone,
+         which read a miss three points too high for a rogue with Precision
+         while the melee page beside it counted the talent. ]]--
+    local hit = hitTotal("hit", "hit") or 0
     local diff = skill - BOSS_DEFENSE
     local miss
 
@@ -854,7 +1092,7 @@ local STAT_GROUPS = {
                 local total = hitTotal("hit", "hit")
                 if not total then return nil end
                 return statPercent(total)
-            end },
+            end, explainHit(false) },
 
             --[==[ **The client's own answer wherever it has one** -- a fork's
                  call, or the crit this client prints on the Attack tooltip --
@@ -875,7 +1113,7 @@ local STAT_GROUPS = {
                 if talents and talents.read then extra = extra + (talents.crit or 0) end
 
                 return statPercent(agility + extra)
-            end },
+            end, explainCrit },
         },
     },
 
@@ -972,7 +1210,7 @@ local STAT_GROUPS = {
 
                 local gear = M:GearBonuses()
                 return statPercent(total + ((gear and gear.rangedHit) or 0))
-            end },
+            end, explainHit(true) },
         },
     },
 
@@ -1009,8 +1247,10 @@ local STAT_GROUPS = {
                 return statNumber((gear.healing or 0) + (gear.spellPower or 0))
             end },
 
-            { "Hit (gear)", function() return gearPercent("spellHit") end },
-            { "Crit (gear)", function() return gearPercent("spellCrit") end },
+            { "Hit (gear)", function() return gearPercent("spellHit") end,
+              explainGear("spellHit") },
+            { "Crit (gear)", function() return gearPercent("spellCrit") end,
+              explainGear("spellCrit") },
         },
     },
 
@@ -1143,6 +1383,13 @@ end
 --[[ The rows a group can actually fill on this client, as label/value pairs.
      Empty rows are dropped here rather than drawn blank, so the box is as tall
      as it has things to say. ]]--
+--[==[ **A row that cannot be worked out says so; a row the client cannot
+     answer is left out.** They were the same case, and the difference is
+     the whole of three reports: a row whose function *threw* vanished as
+     quietly as one whose client call did not exist, and "hit still not
+     calculating" could not be told from "this client has no hit call". An
+     error is a bug, and a bug drawn as an empty space is a bug nobody can
+     report. Now it draws "n/a", and the row's tooltip carries the error. ]==]
 function M:StatRows(id)
     local group = self:StatGroup(id)
     local out = {}
@@ -1152,7 +1399,10 @@ function M:StatRows(id)
         local ok, value = pcall(row[2])
 
         if ok and value then
-            table.insert(out, { label = row[1], value = value })
+            table.insert(out, { label = row[1], value = value, explain = row[3] })
+        elseif not ok then
+            table.insert(out, { label = row[1], value = "n/a", explain = row[3],
+                                error = tostring(value) })
         end
     end
 
@@ -1210,7 +1460,6 @@ end
 local PANE_W = 115
 local PANE_ROWS = 6
 local ROW_H = 13
-local PANE_H = PANE_ROWS * ROW_H
 
 --[[ The row inside the column: BCS draws a 104-wide row 6 in from the left, so
      the label starts at 6 and the number ends 5 from the right. ]]--
@@ -1247,6 +1496,24 @@ local STAT_SLICES = {
     { h = 53, top = 0.125,     bottom = 0.1953125 },
     { h = 16, top = 0.484375,  bottom = 0.609375 },
 }
+
+--[==[ **The pane is the art's height, and the rows sit centred in it.**
+
+     The pane was six rows tall and the art seven pixels taller, hung from the
+     pane's top -- so the rows began on the cap's rim and the slack was all at
+     the foot, and each row's text hung from the top of its thirteen pixels
+     with the rest below it. Both read as the text sitting high in the box,
+     which is what was reported. The block of rows is centred in the art now
+     and each row's text is centred in its row: no offset chosen by eye, a
+     pair of midpoints. ]==]
+local PANE_H = 0
+for i = 1, table.getn(STAT_SLICES) do PANE_H = PANE_H + STAT_SLICES[i].h end
+
+local ROW_TOP = math.floor((PANE_H - (PANE_ROWS * ROW_H)) / 2)
+
+local function rowMiddle(i)
+    return -(ROW_TOP + ((i - 1) * ROW_H) + math.floor(ROW_H / 2))
+end
 
 --[[ The client's own stat blocks, hidden while ours are shown. Named here
      because 1.12 has four of them and a fork may have fewer -- every one is
@@ -1355,19 +1622,40 @@ function M:Pane(side)
         local row = {}
 
         row.label = OB.NewText(f, "OVERLAY", "GameFontHighlightSmall")
-        row.label:SetPoint("TOPLEFT", f, "TOPLEFT",
-                ROW_INSET, -((i - 1) * ROW_H))
+        row.label:SetPoint("LEFT", f, "TOPLEFT", ROW_INSET, rowMiddle(i))
 
         row.value = OB.NewText(f, "OVERLAY", "GameFontHighlightSmall")
-        row.value:SetPoint("TOPRIGHT", f, "TOPRIGHT",
-                -(ROW_INSET - 1), -((i - 1) * ROW_H))
+        row.value:SetPoint("RIGHT", f, "TOPRIGHT", -(ROW_INSET - 1), rowMiddle(i))
 
         --[[ Green on the values, which is the client's own colour for a stat on
              the character sheet and what makes the column read as numbers. ]]--
         row.value:SetTextColor(0.30, 0.85, 0.35)
 
+        --[==[ **The row takes the mouse, for the tooltip that says where the
+             number came from** -- see `RowTooltip`. BetterCharacterStats has
+             one on every row and it is the half of a stat sheet that makes
+             the other half believable: a hit figure with the items, talents
+             and buffs behind it listed underneath is a figure that can be
+             checked against the bags. ]==]
+        row.hover = CreateFrame("Frame", nil, f)
+        row.hover:SetWidth(PANE_W)
+        row.hover:SetHeight(ROW_H)
+        row.hover:SetPoint("TOP", f, "TOP", 0, rowMiddle(i) + math.floor(ROW_H / 2))
+        row.hover:EnableMouse(true)
+        row.hover.ecoPane = f
+        row.hover.ecoIndex = i
+
+        row.hover:SetScript("OnEnter", function()
+            local m = EquadisClassicOverhaul.modules.characterpanel
+            m:RowTooltip(this.ecoPane, this.ecoIndex)
+        end)
+        row.hover:SetScript("OnLeave", function()
+            if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end
+        end)
+
         row.label:Hide()
         row.value:Hide()
+        row.hover:Hide()
 
         f.rows[i] = row
     end
@@ -1476,6 +1764,9 @@ function M:DrawPane(pane, groupId)
     local group = self:StatGroup(groupId)
     local rows = self:StatRows(groupId)
 
+    --[[ Kept for the tooltips: what each row is showing and how it got it. ]]--
+    pane.drawn = rows
+
     --[[ The dropdown's own text where there is one, a plain label where the
          client has no such widget. ]]--
     if pane.drop and type(UIDropDownMenu_SetText) == "function" then
@@ -1487,36 +1778,83 @@ function M:DrawPane(pane, groupId)
     --[[ The client's own face at the configured size: the path is read back
          off the string so the face never changes, only the height. Set only
          when it differs, because SetFont re-measures the string. ]]--
-    local size = tonumber(self:Config().statFontSize) or 9
+    local size = tonumber(self:Config().statFontSize) or 8
+
+    local function sized(text)
+        if text and text.eqEcoStatSize ~= size and text.GetFont and text.SetFont then
+            local face, _, flags = text:GetFont()
+            text:SetFont(face or STANDARD_TEXT_FONT, size, flags)
+            text.eqEcoStatSize = size
+        end
+    end
+
+    --[[ The dropdown's own label too -- the biggest text on the pane, and
+         "the stat text is too high" is said of the pane as a whole. ]]--
+    if pane.drop and pane.drop.GetName and pane.drop:GetName() then
+        sized(getglobal(pane.drop:GetName() .. "Text"))
+    end
+    sized(pane.title)
 
     for i = 1, table.getn(pane.rows) do
         local row = pane.rows[i]
         local data = rows[i]
 
         if data then
-            for _, text in ipairs({ row.label, row.value }) do
-                if text.eqEcoStatSize ~= size and text.GetFont and text.SetFont then
-                    local face, _, flags = text:GetFont()
-                    text:SetFont(face or STANDARD_TEXT_FONT, size, flags)
-                    text.eqEcoStatSize = size
-                end
-            end
+            sized(row.label)
+            sized(row.value)
 
             row.label:SetText(data.label .. ":")
             row.value:SetText(data.value)
 
-
             row.label:Show()
             row.value:Show()
+            if row.hover then row.hover:Show() end
         else
             --[[ Hidden rather than shrinking the box: a pane that changes size
                  with its dropdown is a control that moves while it is being
                  used. ]]--
             row.label:Hide()
             row.value:Hide()
+            if row.hover then row.hover:Hide() end
         end
     end
 
+    return true
+end
+
+--[==[ **Where the number came from, on the row itself.**
+
+     The value line first, then whatever the row's `explain` lists -- for hit,
+     every item, talent and buff that put a point in, by name -- and, for a
+     row that could not be worked out, the error that stopped it. This is
+     `/eq statdebug` on the sheet, where the question is asked. ]==]
+function M:RowTooltip(pane, index)
+    local data = pane and pane.drawn and pane.drawn[index]
+    local row = pane and pane.rows and pane.rows[index]
+
+    if not data or not row or not GameTooltip or not GameTooltip.AddLine then
+        return false
+    end
+
+    OB.OwnTooltip(row.hover, "ANCHOR_RIGHT")
+    GameTooltip:AddLine(data.label .. ": " .. tostring(data.value), 1, 1, 1)
+
+    if data.explain then
+        local ok, lines = pcall(data.explain)
+
+        if ok and type(lines) == "table" then
+            for i = 1, table.getn(lines) do
+                GameTooltip:AddLine(lines[i], 0.8, 0.8, 0.8)
+            end
+        end
+    end
+
+    if data.error then
+        GameTooltip:AddLine("Could not be worked out:", 1, 0.4, 0.4)
+        GameTooltip:AddLine(data.error, 1, 0.6, 0.6, 1)
+    end
+
+    GameTooltip:Show()
     return true
 end
 
@@ -1599,6 +1937,39 @@ function M:DebugStats()
     OB.Raw("  gear scan ran: " .. tostring(gear and gear.read)
             .. "   hit " .. tostring(gear and gear.hit)
             .. "   crit " .. tostring(gear and gear.crit))
+
+    --[==[ **Every line the totals came from**, because a wrong total is
+         settled by the lines behind it and not by the total. Two rounds of
+         "hit isn't counting properly" were answered with pattern work when
+         the lines being read belonged to the previous item; this would have
+         shown that on the first screenshot. ]==]
+    local talents = self:TalentBonuses()
+    local auras = self:AuraBonuses()
+
+    local function traced(list, from)
+        for i = 1, table.getn(list) do
+            local t = list[i]
+            OB.Raw("    " .. from(t) .. ": " .. t.key .. " +" .. tostring(t.value)
+                    .. "   \"" .. tostring(t.line) .. "\"")
+        end
+    end
+
+    OB.Raw("  read from gear:" .. (table.getn(gear.trace) == 0 and " nothing" or ""))
+    traced(gear.trace, function(t)
+        return "slot " .. tostring(t.slot) .. " " .. tostring(t.item)
+    end)
+
+    OB.Raw("  read from talents (" .. tostring(talents and talents.read) .. "):"
+            .. ((not talents or table.getn(talents.trace) == 0) and " nothing" or ""))
+    if talents then
+        traced(talents.trace, function(t) return tostring(t.talent) end)
+    end
+
+    OB.Raw("  read from buffs (" .. tostring(auras and auras.read) .. "):"
+            .. ((not auras or table.getn(auras.trace) == 0) and " nothing" or ""))
+    if auras then
+        traced(auras.trace, function(t) return tostring(t.aura) end)
+    end
 
     --[[ And what each group would draw, which is the question behind the
          question: a call existing and a row filling are not the same thing. ]]--

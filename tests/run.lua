@@ -11708,6 +11708,61 @@ check(roster:Config().scan, "and switches querying on")
 
 roster:SetScanning(false)
 
+--[==[ **The command is three shapes and no verb.** `/chatscan` starts the
+     whole sweep, `/chatscan stop` ends it, `/chatscan 34` and
+     `/chatscan 50-60` take a level or a range. `start` used to be the word
+     in front of all of those and said nothing; it is still accepted and no
+     longer needed. ]==]
+GLOBAL_chatscan = SlashCmdList["EQUADISOVERHAULCHATSCAN"]
+check(type(GLOBAL_chatscan) == "function", "/chatscan is registered")
+
+GLOBAL_chatscan("")
+check(roster:Sweeping(), "bare /chatscan starts the sweep")
+GLOBAL_chatscan("stop")
+check(not roster:Sweeping(), "and /chatscan stop ends it")
+
+Stub.chat = {}
+GLOBAL_chatscan("34")
+check(roster:Sweeping(), "/chatscan 34 scans one level")
+check(string.find(table.concat(Stub.chat, " | "), "level 34", 1, true) ~= nil,
+        "and says which", table.concat(Stub.chat, " | "))
+GLOBAL_chatscan("stop")
+
+Stub.chat = {}
+GLOBAL_chatscan("50-60")
+check(roster:Sweeping(), "/chatscan 50-60 scans a range")
+check(string.find(table.concat(Stub.chat, " | "), "levels 50-60", 1, true) ~= nil,
+        "and says which", table.concat(Stub.chat, " | "))
+GLOBAL_chatscan("stop")
+
+GLOBAL_chatscan("mage")
+check(roster:Sweeping(), "/chatscan mage still scans a class")
+GLOBAL_chatscan("stop")
+
+GLOBAL_chatscan("start 34")
+check(roster:Sweeping(), "the old spelling with start is still understood")
+GLOBAL_chatscan("stop")
+
+Stub.chat = {}
+GLOBAL_chatscan("banana")
+check(not roster:Sweeping(), "a word that is neither starts nothing")
+check(string.find(table.concat(Stub.chat, " | "), "not a level or a class", 1, true) ~= nil,
+        "and is told so", table.concat(Stub.chat, " | "))
+
+Stub.chat = {}
+GLOBAL_chatscan("")
+GLOBAL_chatscan("50-60")
+check(string.find(table.concat(Stub.chat, " | "), "already running", 1, true) ~= nil,
+        "a second scan while one runs is refused", table.concat(Stub.chat, " | "))
+GLOBAL_chatscan("stop")
+
+Stub.chat = {}
+GLOBAL_chatscan("help")
+check(string.find(table.concat(Stub.chat, " | "), "/chatscan 50-60", 1, true) ~= nil,
+        "and help lists the three shapes", table.concat(Stub.chat, " | "))
+check(string.find(table.concat(Stub.chat, " | "), "/chatscan start", 1, true) == nil,
+        "without the old verb")
+
 -- ---------------------------------------------------------------------------
 -- saying what each query was worth
 -- ---------------------------------------------------------------------------
@@ -18731,8 +18786,10 @@ GLOBAL_longLine = GameTooltip:Line(2)
 GLOBAL_longLine:SetText("Equip: Improves your chance to hit by 1% and your "
         .. "chance to get a critical strike by 1% and several other things "
         .. "besides, at considerable length, for the sake of the example.")
+GLOBAL_longLine:Show()
 
 GameTooltipTextLeft1:SetText("A Wordy Item")
+GameTooltipTextLeft1:Show()
 
 tip:Resize(GameTooltip)
 
@@ -20404,6 +20461,18 @@ eq(GLOBAL_old.modules.bags.iconInset, 0, "the shipped inset comes down to nought
 GLOBAL_old = { schema = 42, modules = { bags = { iconInset = 5 } } }
 OB.RunProfileMigrations(GLOBAL_old)
 eq(GLOBAL_old.modules.bags.iconInset, 5, "and a chosen inset is left alone")
+
+--[[ **The stat text, a size smaller.** The shipped nine was still too big;
+     it moves to eight, and a size somebody dragged to stays. ]]--
+GLOBAL_old = { schema = 43, modules = { characterpanel = { statFontSize = 9 } } }
+OB.RunProfileMigrations(GLOBAL_old)
+eq(GLOBAL_old.modules.characterpanel.statFontSize, 8,
+        "the shipped stat text size comes down to eight")
+
+GLOBAL_old = { schema = 43, modules = { characterpanel = { statFontSize = 11 } } }
+OB.RunProfileMigrations(GLOBAL_old)
+eq(GLOBAL_old.modules.characterpanel.statFontSize, 11,
+        "and a chosen stat text size is left alone")
 
 --[[ **A size somebody chose is left alone.** The migration moves the shipped
      value and nothing else -- of the two possible mistakes, overwriting a
@@ -23933,7 +24002,7 @@ GLOBAL_moved = {}
 Stub.SetBag(0, { { name = "Arrow", quality = 1, count = 12, locked = 1 },
                  { name = "Arrow", quality = 1, count = 8 } })
 
-eq(bags:CleanStep(), false, "a locked slot is not moved")
+eq(bags:CleanStep(), "locked", "a locked slot is not moved -- and is waited for")
 eq(table.getn(GLOBAL_moved), 0, "and no pickup is even attempted")
 
 PickupContainerItem = GLOBAL_realPickup
@@ -23988,6 +24057,264 @@ Stub.SetBag(0, { slots = 6, [4] = { name = "Bread", quality = 1, count = 5 } })
 
 bags:SetFavourite(8888, true)
 eq(bags:SortStep(), false, "a favourite stays in the slot it was put in")
+
+-- ---------------------------------------------------------------------------
+-- a whole run, with the client's timing
+-- ---------------------------------------------------------------------------
+
+--[==[ **The sort ended on the first locked slot**, which is the first slot it
+     looks at after a move: the client's `BAG_UPDATE` arrives per bag, and the
+     first one lands while the two slots just touched are still locked. The
+     step answered `false` for "locked" as well as for "finished", and the run
+     read it as finished. One item moved, then nothing -- which from the front
+     is the sort not working at all.
+
+     Driven here the way the client drives it: a move, an update while locked,
+     the locks clearing, an update again. The harness moves items the way the
+     client does now -- drop into empty, merge onto the same kind, trade places
+     with a different one, cursor empty after -- which it did not, so a whole run
+     could never have been watched. ]==]
+--[[ All three in the catalogue, so "kind" -- the first key -- compares equal
+     and what is being watched is the quality order and the gap closing. ]]--
+Stub.items[8001] = { name = "Rune Thread", rarity = 1, maxStack = 20 }
+Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1 }
+Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20 }
+Stub.itemIds["Rune Thread"] = 8001
+Stub.itemIds["Sulfuras"] = 8102
+Stub.itemIds["Tough Jerky"] = 8103
+
+Stub.bags = {}
+Stub.SetBag(0, { slots = 8,
+    [1] = { name = "Rune Thread", quality = 1, count = 4 },
+    [3] = { name = "Sulfuras", quality = 5, count = 1 },
+    [4] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [6] = { name = "Rune Thread", quality = 1, count = 3 },
+})
+Stub.SettleBags()
+GLOBAL_favs = bags:Favourites()
+for k in pairs(GLOBAL_favs) do GLOBAL_favs[k] = nil end
+
+bags:Sort()
+check(bags.sorting, "a bag out of order starts a run")
+
+--[[ The first update arrives while the moved slots are still locked. ]]--
+event = "BAG_UPDATE"
+bags:OnEvent()
+event = nil
+
+check(bags.sorting, "an update that finds the slots still locked does not end it")
+check((bags.sortWaits or 0) >= 1, "it is counted as a wait", tostring(bags.sortWaits))
+
+--[[ Then the client releases them and says so, and the run carries on. ]]--
+for GLOBAL_i = 1, 20 do
+    if not bags.sorting then break end
+    Stub.SettleBags()
+    event = "ITEM_LOCK_CHANGED"
+    bags:OnEvent()
+    event = nil
+end
+
+check(not bags.sorting, "and it finishes once the locks clear",
+        "moves=" .. tostring(bags.sortMoves) .. " waits=" .. tostring(bags.sortWaits))
+
+GLOBAL_bagNow = {}
+for GLOBAL_i = 1, 8 do
+    local it = Stub.bags[0][GLOBAL_i]
+    table.insert(GLOBAL_bagNow, it and (it.name .. "x" .. (it.count or 1)) or "-")
+end
+GLOBAL_bagText = table.concat(GLOBAL_bagNow, " | ")
+
+eq(GLOBAL_bagNow[1], "Sulfurasx1", "the epic is first", GLOBAL_bagText)
+check(GLOBAL_bagNow[2] ~= "-" and GLOBAL_bagNow[3] ~= "-",
+        "and the gaps are closed", GLOBAL_bagText)
+eq(GLOBAL_bagNow[4], "-", "with nothing left past the items", GLOBAL_bagText)
+
+GLOBAL_threadPiles = 0
+for GLOBAL_i = 1, 8 do
+    if Stub.bags[0][GLOBAL_i] and Stub.bags[0][GLOBAL_i].name == "Rune Thread" then
+        GLOBAL_threadPiles = GLOBAL_threadPiles + 1
+        eq(Stub.bags[0][GLOBAL_i].count, 7, "the two loose piles became one of seven")
+    end
+end
+eq(GLOBAL_threadPiles, 1, "and there is exactly one pile of it", GLOBAL_bagText)
+
+--[[ A lock that never clears does not keep a run open for ever. ]]--
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [3] = { name = "Sulfuras", quality = 5, count = 1, locked = true },
+})
+bags:Sort()
+for GLOBAL_i = 1, 80 do
+    if not bags.sorting then break end
+    event = "BAG_UPDATE"
+    bags:OnEvent()
+    event = nil
+end
+check(not bags.sorting, "a lock that never clears ends the run after a bounded wait",
+        tostring(bags.sortWaits))
+
+Stub.SetBag(0, {})
+Stub.SettleBags()
+
+--[==[ **Across every bag, not the first.** Reported as "working better, but
+     not across all bags". Five bags, items scattered through all of them,
+     partial piles in two, driven the way the client drives it -- and at the
+     end every item is in the first slots in bag order, every pile is one
+     pile, and the order holds from the backpack through the last bag. ]==]
+Stub.items[8104] = { name = "Elixir of the Mongoose", rarity = 1, maxStack = 5,
+        itemType = "Consumable", subType = "Potion" }
+Stub.items[8105] = { name = "Sunder Plate", rarity = 3, maxStack = 1,
+        itemType = "Armor", subType = "Plate", equipLoc = "INVTYPE_CHEST" }
+Stub.itemIds["Elixir of the Mongoose"] = 8104
+Stub.itemIds["Sunder Plate"] = 8105
+
+Stub.bags = {}
+Stub.SetBag(0, { slots = 6,
+    [2] = { name = "Rune Thread", quality = 1, count = 4 },
+    [5] = { name = "Elixir of the Mongoose", quality = 1, count = 2 },
+})
+Stub.SetBag(1, { slots = 4,
+    [1] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [4] = { name = "Sulfuras", quality = 5, count = 1 },
+})
+Stub.SetBag(2, { slots = 4 })
+Stub.SetBag(3, { slots = 4,
+    [2] = { name = "Rune Thread", quality = 1, count = 3 },
+    [3] = { name = "Sunder Plate", quality = 3, count = 1 },
+})
+Stub.SetBag(4, { slots = 4,
+    [1] = { name = "Elixir of the Mongoose", quality = 1, count = 1 },
+    [4] = { name = "Tough Jerky", quality = 1, count = 2 },
+})
+Stub.SettleBags()
+
+bags:Sort()
+check(bags.sorting, "five bags out of order start a run")
+
+for GLOBAL_i = 1, 120 do
+    if not bags.sorting then break end
+    --[[ The per-bag update while still locked, then the release. ]]--
+    event = "BAG_UPDATE"
+    bags:OnEvent()
+    Stub.SettleBags()
+    event = "ITEM_LOCK_CHANGED"
+    bags:OnEvent()
+    event = nil
+end
+event = nil
+
+check(not bags.sorting, "and the run finishes",
+        "moves=" .. tostring(bags.sortMoves) .. " waits=" .. tostring(bags.sortWaits))
+
+--[[ Walk every slot in bag order: items first, then nothing, and the items
+     in the sort's own order. ]]--
+GLOBAL_walk, GLOBAL_seenGap, GLOBAL_afterGap, GLOBAL_disorder = {}, false, false, false
+GLOBAL_prevRow = nil
+for GLOBAL_b = 0, 4 do
+    for GLOBAL_s = 1, GetContainerNumSlots(GLOBAL_b) do
+        local it = Stub.bags[GLOBAL_b][GLOBAL_s]
+        table.insert(GLOBAL_walk, GLOBAL_b .. ":" .. (it and (it.name .. "x" .. (it.count or 1)) or "-"))
+        if not it then
+            GLOBAL_seenGap = true
+        else
+            if GLOBAL_seenGap then GLOBAL_afterGap = true end
+            local row = { link = Stub.ItemLink(it.name, it.quality), count = it.count,
+                          id = Stub.ItemId(it.name) }
+            if GLOBAL_prevRow and bags:OrderBefore(row, GLOBAL_prevRow) then
+                GLOBAL_disorder = true
+            end
+            GLOBAL_prevRow = row
+        end
+    end
+end
+GLOBAL_walkText = table.concat(GLOBAL_walk, " | ")
+
+check(not GLOBAL_afterGap, "every item sits before every empty slot, across all five bags",
+        GLOBAL_walkText)
+check(not GLOBAL_disorder, "and the order holds from the backpack to the last bag",
+        GLOBAL_walkText)
+
+GLOBAL_piles = {}
+for GLOBAL_b = 0, 4 do
+    for GLOBAL_s = 1, GetContainerNumSlots(GLOBAL_b) do
+        local it = Stub.bags[GLOBAL_b][GLOBAL_s]
+        if it then GLOBAL_piles[it.name] = (GLOBAL_piles[it.name] or 0) + 1 end
+    end
+end
+eq(GLOBAL_piles["Rune Thread"], 1, "the thread across two bags is one pile", GLOBAL_walkText)
+eq(GLOBAL_piles["Tough Jerky"], 1, "and so is the jerky", GLOBAL_walkText)
+eq(GLOBAL_piles["Elixir of the Mongoose"], 1, "and the elixir", GLOBAL_walkText)
+
+--[==[ **And when the client's events dry up, the clock carries on.**
+
+     The last `ITEM_LOCK_CHANGED` of a move can arrive while the other slot
+     still reads locked. Driven by events alone the run waits for an event
+     that never comes -- and stops, part way through the bags, with nothing
+     wrong on screen to say why. Bagshui restacks on a timer for exactly
+     this; so does this run now, at Bagshui's 0.15 s. ]==]
+--[[ Two moves, and the second needs a slot the first is still holding: the
+     epic trades places with the plate, and then the jerky has to trade with
+     the plate again. ]]--
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Sunder Plate", quality = 3, count = 1 },
+    [2] = { name = "Sulfuras", quality = 5, count = 1 },
+    [3] = { name = "Tough Jerky", quality = 1, count = 5 },
+})
+Stub.SetBag(1, { slots = 4 })
+Stub.SetBag(2, { slots = 4 })
+Stub.SettleBags()
+
+bags:Sort()
+check(bags.sorting, "a run starts")
+check(bags.ticker and bags.ticker:IsShown(), "and the ticker with it")
+
+--[[ The client's events, all of them while the slots are still locked; then
+     the locks clear and nothing says so. ]]--
+event = "BAG_UPDATE"
+bags:OnEvent()
+event = "ITEM_LOCK_CHANGED"
+bags:OnEvent()
+event = nil
+Stub.SettleBags()
+
+GLOBAL_movesBefore = bags.sortMoves
+check(bags.sorting, "the run is waiting on a lock the events said nothing about",
+        tostring(bags.sortWaits))
+
+for GLOBAL_i = 1, 60 do
+    if not bags.sorting then break end
+    Stub.Tick(0.2)
+    Stub.SettleBags()
+end
+
+check(bags.sortMoves > GLOBAL_movesBefore, "the clock moves it on",
+        tostring(bags.sortMoves) .. " after " .. tostring(GLOBAL_movesBefore))
+check(not bags.sorting, "and finishes the run with no event at all")
+check(not bags.ticker:IsShown(), "and the ticker stands down")
+
+GLOBAL_walk = {}
+for GLOBAL_b = 0, 2 do
+    for GLOBAL_s = 1, 4 do
+        local it = Stub.bags[GLOBAL_b][GLOBAL_s]
+        table.insert(GLOBAL_walk, GLOBAL_b .. ":" .. (it and it.name or "-"))
+    end
+end
+GLOBAL_walkText = table.concat(GLOBAL_walk, " | ")
+--[[ Kind first, descending: the two miscellaneous items before the armour,
+     and the epic before the jerky within them. ]]--
+eq(GLOBAL_walk[1], "0:Sulfuras", "the epic is first", GLOBAL_walkText)
+eq(GLOBAL_walk[2], "0:Tough Jerky", "the jerky second", GLOBAL_walkText)
+eq(GLOBAL_walk[3], "0:Sunder Plate", "the plate third", GLOBAL_walkText)
+eq(GLOBAL_walk[4], "0:-", "and nothing after them", GLOBAL_walkText)
+
+for GLOBAL_b = 0, 4 do Stub.SetBag(GLOBAL_b, nil) end
+Stub.bags = {}
+Stub.items[8104], Stub.items[8105] = nil, nil
+Stub.itemIds["Elixir of the Mongoose"], Stub.itemIds["Sunder Plate"] = nil, nil
+
+--[[ The catalogue entries are this block's own. ]]--
+Stub.items[8001], Stub.items[8102], Stub.items[8103] = nil, nil, nil
+Stub.itemIds["Rune Thread"], Stub.itemIds["Sulfuras"], Stub.itemIds["Tough Jerky"] = nil, nil, nil
 bags:SetFavourite(8888, nil)
 
 -- ---------------------------------------------------------------------------
@@ -24636,18 +24963,78 @@ eq(bags:FamilyOverlap(1, 2), false, "two different kinds do not")
 check(bags:FamilyOverlap(3, 2), "sharing any one bit is enough")
 eq(bags:FamilyOverlap(0, 4), false, "and something with no flag shares nothing")
 
-Stub.itemFamily[7777] = 1
+--[==[ **On 1.12 the family is read off the item's type**, because
+     `GetItemFamily` does not exist there -- it arrived two expansions later.
+     The stub shipped it anyway, so this path had never run: in game every bag
+     was ordinary and every item fitted everywhere, and a hunter's sort aimed
+     bandages at the quiver until the move cap. ]==]
+eq(GetItemFamily, nil, "a 1.12 client has no GetItemFamily")
+
+Stub.items[7777] = { name = "Arrow", rarity = 1, maxStack = 200,
+        itemType = "Projectile", subType = "Arrow" }
+Stub.items[8888] = { name = "Bread", rarity = 1, maxStack = 20,
+        itemType = "Consumable", subType = "Food & Drink" }
+Stub.itemIds["Arrow"], Stub.itemIds["Bread"] = 7777, 8888
 
 GLOBAL_ammo = { link = Stub.ItemLink("Arrow", 1), id = 7777, count = 5 }
 GLOBAL_food = { link = Stub.ItemLink("Bread", 1), id = 8888, count = 5 }
 
+eq(bags:ItemFamily(GLOBAL_ammo.link), 1, "an arrow is quiver kind, by its type")
+eq(bags:ItemFamily(GLOBAL_food.link), 0, "and bread is ordinary")
+
 check(bags:FitsIn(GLOBAL_ammo, 1), "an arrow fits a quiver")
-eq(bags:FitsIn(GLOBAL_ammo, 2), false, "but not a soul bag")
+eq(bags:FitsIn(GLOBAL_ammo, 4), false, "but not a soul bag")
+eq(bags:FitsIn(GLOBAL_food, 1), false, "and bread does not fit a quiver")
 check(bags:FitsIn(GLOBAL_food, 0), "an ordinary bag takes anything")
 check(bags:FitsIn({ empty = true }, 4),
         "and an empty slot is a fit by definition -- there is nothing there to disagree")
 
-Stub.itemFamily[7777] = nil
+--[[ The bag's own kind comes from the bag item worn in that slot. ]]--
+Stub.items[9001] = { name = "Light Quiver", rarity = 1, maxStack = 1,
+        itemType = "Quiver", subType = "Quiver" }
+Stub.equipped[ContainerIDToInventoryID(1)] = { 9001, "Quiver" }
+eq(bags:BagFamily(1), 1, "a worn quiver makes bag one a quiver")
+Stub.equipped[ContainerIDToInventoryID(1)] = nil
+eq(bags:BagFamily(1), 0, "and an empty bag slot is ordinary")
+
+--[[ A later client answers directly, and the answer is taken as given. ]]--
+Stub.SetItemFamilyAPI(true)
+Stub.itemFamily[8888] = 8
+eq(bags:ItemFamily(GLOBAL_food.link), 8, "with GetItemFamily present it is asked")
+Stub.itemFamily[8888] = nil
+Stub.SetItemFamilyAPI(false)
+
+--[==[ **A move the client refuses is not tried for ever.** On the 1.12 path a
+     bag whose subtype this addon does not know reads as ordinary, and the
+     client can still refuse a drop into it. The same move asked for twice in a
+     row is the sign, and it ends the run rather than spending the whole move
+     budget on it. ]==]
+Stub.bags = {}
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Bread", quality = 1, count = 5 },
+    [3] = { name = "Arrow", quality = 1, count = 5 },
+})
+Stub.SettleBags()
+GLOBAL_refusePickup = PickupContainerItem
+PickupContainerItem = function(bag, slot)
+    --[[ The client saying no: the item goes back where it was, nothing locks. ]]--
+    Stub.cursor = nil
+end
+bags:Sort()
+for GLOBAL_i = 1, 10 do
+    if not bags.sorting then break end
+    event = "BAG_UPDATE"
+    bags:OnEvent()
+    event = nil
+end
+PickupContainerItem = GLOBAL_refusePickup
+check(not bags.sorting, "a refused move ends the run")
+check((bags.sortMoves or 0) <= 2, "after at most one repeat",
+        tostring(bags.sortMoves))
+
+Stub.items[7777], Stub.items[8888], Stub.items[9001] = nil, nil, nil
+Stub.itemIds["Arrow"], Stub.itemIds["Bread"] = nil, nil
+Stub.SetBag(0, {})
 
 --[[ The backpack has no equipment slot behind it and is always ordinary, which
      is the one bag whose kind can be answered without asking the client. ]]--
@@ -24873,19 +25260,40 @@ OB.profile.modules.bags.border = 3
 OB.ForgetLooks()
 bags:Draw()
 
-GLOBAL_bagBackdrop = GLOBAL_win:GetBackdrop()
+--[==[ **The edge is on a frame of its own, hung outside the fill.** On the
+     window's own backdrop the Classic edge's ink began a pixel in and the
+     fill ran out underneath it -- the leak the cast bar and the tooltip were
+     already fixed for, and the same fix here: the fill flush to the frame,
+     the border frame `outset` outside it so the ink lands on the fill's
+     boundary. ]==]
+GLOBAL_bagBackdrop = GLOBAL_win.border:GetBackdrop()
 check(GLOBAL_bagBackdrop and GLOBAL_bagBackdrop.edgeFile
         and string.find(GLOBAL_bagBackdrop.edgeFile, "Tooltip-Border", 1, true) ~= nil,
         "Classic draws the tooltip edge round the window",
         tostring(GLOBAL_bagBackdrop and GLOBAL_bagBackdrop.edgeFile))
+eq(GLOBAL_win:GetBackdrop().edgeFile, nil,
+        "and the window's own backdrop is the fill alone")
+eq(GLOBAL_win:GetBackdrop().insets.left, 0, "flush to the frame")
+
+GLOBAL_hang = { GLOBAL_win.border:GetPoint(1) }
+eq(GLOBAL_hang[4], -math.floor(OB.borderEdges[3].outset),
+        "the border hangs the Classic edge's outset outside the window",
+        tostring(GLOBAL_hang[4]))
+
+OB.profile.modules.bags.border = 4
+OB.ForgetLooks()
+bags:Draw()
+GLOBAL_hang = { GLOBAL_win.border:GetPoint(1) }
+eq(GLOBAL_hang[4], -math.floor(OB.borderEdges[4].outset),
+        "and the Blizzard ornament's, which is fourteen",
+        tostring(GLOBAL_hang[4]))
 
 OB.profile.modules.bags.border = 1
 OB.ForgetLooks()
 bags:Draw()
 
+check(not GLOBAL_win.border:IsShown(), "None draws no edge at all")
 GLOBAL_bagBackdrop = GLOBAL_win:GetBackdrop()
-eq(GLOBAL_bagBackdrop and GLOBAL_bagBackdrop.edgeFile, nil,
-        "and None draws no edge at all")
 check(GLOBAL_bagBackdrop and GLOBAL_bagBackdrop.bgFile ~= nil,
         "while the background stays")
 
@@ -24894,6 +25302,29 @@ bags:Draw()
 GLOBAL_bagGround = GLOBAL_win.backdropColor or {}
 near(GLOBAL_bagGround[1] or 0, 0.2, 0.001, "which is still colour pickable",
         tostring(GLOBAL_bagGround[1]))
+
+--[==[ **No border pushes the content in any more.** The Blizzard ornament
+     used to be drawn over the first eleven pixels of the fill, and the
+     content moved in and the window grew to clear it. Hung outside the
+     window, it covers nothing, so the content sits where it sits for every
+     style and the window is one size. ]==]
+OB.profile.modules.bags.border = 2
+OB.ForgetLooks()
+bags:Draw()
+eq(bags:BorderInset(), 0, "the flat edge needs no extra room")
+GLOBAL_thinW = GLOBAL_win:GetWidth()
+GLOBAL_thinTop = { GLOBAL_win.close:GetPoint(1) }
+
+OB.profile.modules.bags.border = 4
+OB.ForgetLooks()
+bags:Draw()
+eq(bags:BorderInset(), 0, "and neither does the Blizzard ornament")
+eq(GLOBAL_win:GetWidth(), GLOBAL_thinW, "so the window is the same width under it",
+        tostring(GLOBAL_win:GetWidth()))
+GLOBAL_blizzTop = { GLOBAL_win.close:GetPoint(1) }
+eq(GLOBAL_blizzTop[4], GLOBAL_thinTop[4],
+        "and the close button does not move for it",
+        tostring(GLOBAL_blizzTop[4]))
 
 OB.profile.modules.bags.border = 2
 OB.profile.modules.bags.color = { 0, 0, 0, 0.5 }
@@ -27331,6 +27762,57 @@ Stub.player.combo = 3
 plates:Refresh(adoptedEnemy)
 eq(adoptedEnemy.combo[3].shown, true, "three points show three")
 eq(adoptedEnemy.combo[4].shown, false, "and not four")
+
+--[==[ **They are the target frame's own orbs.** Each earned point is the
+     client's socket ring with the red orb lit inside it, cut from
+     `UI-ComboPoint` the way the target frame cuts it -- the orb's cut read
+     off `ComboPoint1Highlight` itself. Six-pixel coloured squares were what
+     this replaced. ]==]
+eq(adoptedEnemy.comboOrbs[3].shown, true, "with the orb lit inside the socket")
+eq(adoptedEnemy.comboOrbs[4].shown, false, "and not in the fourth")
+eq(adoptedEnemy.comboOrbs[1]:GetTexture(), ComboPoint1Highlight:GetTexture(),
+        "the orb is the target frame's own texture")
+GLOBAL_clientOrb = { ComboPoint1Highlight:GetTexCoord() }
+GLOBAL_plateOrb = { adoptedEnemy.comboOrbs[1]:GetTexCoord() }
+near(GLOBAL_plateOrb[1], GLOBAL_clientOrb[1], 0.0001, "cut where the client cuts it (left)")
+near(GLOBAL_plateOrb[2], GLOBAL_clientOrb[5], 0.0001, "and (right)")
+eq(adoptedEnemy.combo[1]:GetTexture(), adoptedEnemy.comboOrbs[1]:GetTexture(),
+        "the ring is from the same file")
+GLOBAL_plateRing = { adoptedEnemy.combo[1]:GetTexCoord() }
+near(GLOBAL_plateRing[2], 0.375, 0.0001, "cut to the socket")
+
+--[[ Twelve tall at the art's three-to-four, the orb eight of twelve wide,
+     growing leftward from the bar's right end as the target frame's row
+     does. ]]--
+eq(adoptedEnemy.combo[1]:GetHeight(), 12, "a point is the set height")
+eq(adoptedEnemy.combo[1]:GetWidth(), 9, "at the art's proportion")
+eq(adoptedEnemy.comboOrbs[1]:GetWidth(), 6, "with the orb two thirds of it")
+GLOBAL_c1 = { adoptedEnemy.combo[1]:GetPoint(1) }
+GLOBAL_c2 = { adoptedEnemy.combo[2]:GetPoint(1) }
+eq(GLOBAL_c1[1], "TOPRIGHT", "hung from the bar's right end")
+eq(GLOBAL_c1[4] - GLOBAL_c2[4], 10, "each a point and a pixel further left")
+
+cfg.comboSize = 16
+plates:Style(adoptedEnemy)
+eq(adoptedEnemy.combo[1]:GetHeight(), 16, "the size setting takes")
+eq(adoptedEnemy.combo[1]:GetWidth(), 12, "keeping the proportion")
+cfg.comboSize = 12
+plates:Style(adoptedEnemy)
+
+--[[ Read, not remembered: a client that cuts its orb elsewhere is followed,
+     and one with no combo frame at all gets the 1.12 cut. ]]--
+ComboPoint1Highlight:SetTexCoord(0.4, 0, 0.4, 1, 0.6, 0, 0.6, 1)
+GLOBAL_art = plates:ComboArt(true)
+near(GLOBAL_art.orb[1], 0.4, 0.0001, "a client that cuts its orb elsewhere is followed")
+near(GLOBAL_art.orb[2], 0.6, 0.0001, "on both sides")
+ComboPoint1Highlight:SetTexCoord(0.375, 0, 0.375, 1, 0.5625, 0, 0.5625, 1)
+
+GLOBAL_clientHighlight = ComboPoint1Highlight
+ComboPoint1Highlight = nil
+GLOBAL_art = plates:ComboArt(true)
+near(GLOBAL_art.orb[1], 0.375, 0.0001, "with nothing to read, the 1.12 cut stands")
+ComboPoint1Highlight = GLOBAL_clientHighlight
+plates:ComboArt(true)
 
 plates:Refresh(adoptedFriend)
 eq(adoptedFriend.combo[1].shown, false, "a plate that is not the target shows none")
@@ -37004,6 +37486,42 @@ check(not GLOBAL_raid.buttons[1].looter:IsShown(),
 check(GLOBAL_raid.buttons[1].leader:IsShown(),
         "the leader keeps the crown while somebody else holds the bag")
 
+--[==[ **The bag sits at the edge when there is no crown beside it.** It was
+     anchored to the crown's left whether or not the crown was shown, and a
+     hidden texture keeps its rectangle -- so a master looter who was not the
+     leader wore the bag a crown's width in from the edge, beside nothing.
+     Reported as "slightly offset", which is what it was. ]==]
+GLOBAL_bagPoint = { GLOBAL_raid.buttons[2].looter:GetPoint(1) }
+eq(GLOBAL_bagPoint[2], GLOBAL_raid.buttons[2].health,
+        "on a looter who does not lead, the bag hangs off the bar itself")
+eq(GLOBAL_bagPoint[3], "RIGHT", "at its right edge")
+
+--[[ And inboard of the crown when the same person has both. ]]--
+Stub.masterLooterRaid = 1
+GLOBAL_raid:Apply()
+GLOBAL_bagPoint = { GLOBAL_raid.buttons[1].looter:GetPoint(1) }
+eq(GLOBAL_bagPoint[2], GLOBAL_raid.buttons[1].leader,
+        "on the leader, the bag hangs off the crown")
+eq(GLOBAL_bagPoint[3], "LEFT", "inboard of it")
+eq(GLOBAL_raid.buttons[1].looter:GetWidth(), GLOBAL_raid.buttons[1].leader:GetWidth(),
+        "and the two are the same size, as the client draws them")
+
+--[[ The state word is inboard of whatever badge is shown, not under it. ]]--
+Stub.group[1].connected = false
+GLOBAL_raid:Apply()
+GLOBAL_wordPoint = { GLOBAL_raid.buttons[1].status:GetPoint(1) }
+eq(GLOBAL_wordPoint[2], GLOBAL_raid.buttons[1].looter,
+        "the state word hangs off the innermost badge")
+eq(GLOBAL_wordPoint[3], "LEFT", "inboard of it")
+
+Stub.group[1].connected = nil
+Stub.masterLooterRaid = 2
+GLOBAL_raid:Apply()
+
+GLOBAL_wordPoint = { GLOBAL_raid.buttons[3].status:GetPoint(1) }
+eq(GLOBAL_wordPoint[2], GLOBAL_raid.buttons[3].health,
+        "and off the bar's own edge where there is no badge at all")
+
 --[[ Master loot switched off takes the bag with it. There is no event for the
      loot method changing, which is why this is read every refresh. ]]--
 Stub.lootMethod = "group"
@@ -38281,6 +38799,7 @@ Stub.player.talents["2:3"] = 3
 Stub.tooltips["talent2:3"] = {
     "Precision",
     "Rank 3/5",
+    "Requires 5 points in Combat Talents",
     "Increases your chance to hit with melee weapons by 3%.",
     "Next rank:",
     "Increases your chance to hit with melee weapons by 4%.",
@@ -38302,6 +38821,200 @@ for GLOBAL_i = 1, table.getn(GLOBAL_melee) do
     GLOBAL_have[GLOBAL_melee[GLOBAL_i].label] = GLOBAL_melee[GLOBAL_i].value
 end
 eq(GLOBAL_have["Hit"], "5.00%", "so the Hit row is gear and talents together")
+
+--[==[ **A line past the end belongs to the last item, not this one.**
+
+     The client reuses the tooltip's font strings and `ClearLines` hides them
+     without blanking them, so after a long tooltip a short one leaves the
+     long one's tail readable past `NumLines()`. A reader that walks to the
+     first nil reads that tail again: bracers with a hit line, then plain
+     gloves, and the gloves count the bracers' hit a second time. Wrist (9)
+     is read before hands (10), so this is that order. ]==]
+Stub.equipped[9] = { 8003 }
+Stub.tooltips["item9"] = {
+    "Bracers of Something",
+    "+5 Stamina",
+    "Equip: Improves your chance to hit by 1%.",
+    "Equip: Improves your chance to get a critical strike by 1%.",
+    "Equip: Improves your chance to hit with spells by 1%.",
+    "Equip: Increases damage and healing done by magical spells and effects by up to 10.",
+    "Equip: Increases damage done by Fire spells and effects by up to 5.",
+}
+Stub.tooltips["item10"] = { "Plain Gloves", "+3 Stamina" }
+
+GLOBAL_gear = GLOBAL_sheet:GearBonuses(true)
+eq(GLOBAL_gear.hit, 2, "a short item after a long one reads its own lines only",
+        tostring(GLOBAL_gear.hit))
+eq(GLOBAL_gear.crit, 3, "and the crit past its end is the bracers' once",
+        tostring(GLOBAL_gear.crit))
+eq(GLOBAL_gear.spellHit, 1, "spell hit likewise")
+eq(GLOBAL_gear.spellPower, 10, "and spell power")
+eq(GLOBAL_gear.schools["Fire"], 5, "and the school")
+
+--[==[ **The same for a talent**: Precision's tooltip is six lines and the
+     next talent's three, and the first line left over is Precision's own
+     sentence. Read to the first nil, that is a second Precision. ]==]
+Stub.player.talents["2:4"] = 1
+Stub.tooltips["talent2:4"] = { "Dagger Specialization", "Rank 1/5",
+        "Increases your chance to get a critical strike with Daggers by 1%." }
+
+GLOBAL_talents = GLOBAL_sheet:TalentBonuses(true)
+eq(GLOBAL_talents.hit, 3, "a short talent tooltip after a long one is its own",
+        tostring(GLOBAL_talents.hit))
+
+Stub.player.talents["2:4"] = nil
+Stub.tooltips["talent2:4"] = nil
+
+--[==[ **A set bonus is printed on every piece and counted once.** Both
+     bracers and gloves carry the set's list; the active line reads "Set:",
+     the one out of reach "(5) Set:". One percent of hit from the set, not
+     two and not three. ]==]
+Stub.tooltips["item9"] = {
+    "Bracers of the Set",
+    "Set of Something (2/5)",
+    "  Bracers of the Set",
+    "  Gloves of the Set",
+    "Set: Improves your chance to hit by 1%.",
+    "(5) Set: Improves your chance to get a critical strike by 2%.",
+}
+Stub.tooltips["item10"] = {
+    "Gloves of the Set",
+    "Set of Something (2/5)",
+    "  Bracers of the Set",
+    "  Gloves of the Set",
+    "Set: Improves your chance to hit by 1%.",
+    "(5) Set: Improves your chance to get a critical strike by 2%.",
+}
+
+GLOBAL_gear = GLOBAL_sheet:GearBonuses(true)
+eq(GLOBAL_gear.hit, 2, "an active set bonus is counted once for the set",
+        tostring(GLOBAL_gear.hit))
+eq(GLOBAL_gear.crit, 2, "and an inactive one not at all",
+        tostring(GLOBAL_gear.crit))
+
+--[==[ **A buff that grants hit is hit**, the way BetterCharacterStats counts
+     it, and a debuff that takes hit away is taken away. Neither is gear and
+     neither is a talent; both are the chance to hit right now, which is what
+     the row is for. Read off the buff tooltips, the same three sentences BCS
+     reads, and nothing looser. ]==]
+Stub.player.buffs = { "Interface\\Icons\\INV_Misc_Food_Hit" }
+Stub.tooltips["buff1"] = { "Well Fed", "Chance to hit increased by 2%." }
+Stub.player.debuffs = { "Interface\\Icons\\Spell_Nature_InsectSwarm" }
+Stub.tooltips["buff2"] = { "Insect Swarm", "Chance to hit reduced by 2%." }
+
+GLOBAL_auras = GLOBAL_sheet:AuraBonuses(true)
+eq(GLOBAL_auras.hit, 2, "a buff's hit is read", tostring(GLOBAL_auras.hit))
+eq(GLOBAL_auras.hitDebuff, 2, "and a debuff's", tostring(GLOBAL_auras.hitDebuff))
+
+Stub.player.debuffs = {}
+GLOBAL_sheet:AuraBonuses(true)
+
+GLOBAL_melee = GLOBAL_sheet:StatRows("melee")
+GLOBAL_have = {}
+for GLOBAL_i = 1, table.getn(GLOBAL_melee) do
+    GLOBAL_have[GLOBAL_melee[GLOBAL_i].label] = GLOBAL_melee[GLOBAL_i].value
+end
+eq(GLOBAL_have["Hit"], "7.00%", "and the Hit row is gear, talents and the buff",
+        tostring(GLOBAL_have["Hit"]))
+
+--[==[ **Boss miss comes off the whole of hit.** It was gear alone: a rogue
+     with Precision read a miss three points too high on the boss page while
+     the melee page said five percent of hit. One number, used in both. ]==]
+TURTLE_WOW_VERSION = "1.17.2"
+near(GLOBAL_sheet:BossMiss(300, false), 8 - 7, 0.001,
+        "the boss page's miss takes talents and buffs off too",
+        tostring(GLOBAL_sheet:BossMiss(300, false)))
+TURTLE_WOW_VERSION = nil
+
+--[==[ **Hovering a row says where its number came from.** The value, then
+     gear item by item, talents by name, buffs by name. This is `/eq statdebug`
+     on the sheet itself, and it is why the fourth "hit still not calculating"
+     can be answered by whoever is looking at it. ]==]
+GLOBAL_left = GLOBAL_sheet:Pane("left")
+GLOBAL_sheet:SetPaneGroup("left", "melee")
+GLOBAL_hitIndex = nil
+for GLOBAL_i = 1, table.getn(GLOBAL_left.drawn) do
+    if GLOBAL_left.drawn[GLOBAL_i].label == "Hit" then GLOBAL_hitIndex = GLOBAL_i end
+end
+check(GLOBAL_hitIndex ~= nil, "the melee pane has a Hit row to hover")
+check(GLOBAL_left.rows[GLOBAL_hitIndex].hover:IsShown(), "and the row takes the mouse")
+
+Stub.Hover(GLOBAL_left.rows[GLOBAL_hitIndex].hover)
+GLOBAL_tipText = {}
+for GLOBAL_i = 1, GameTooltip:NumLines() do
+    table.insert(GLOBAL_tipText, getglobal("GameTooltipTextLeft" .. GLOBAL_i):GetText())
+end
+GLOBAL_tipText = table.concat(GLOBAL_tipText, " | ")
+
+check(string.find(GLOBAL_tipText, "Hit: 7.00%", 1, true) ~= nil,
+        "the tooltip leads with the row", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Gear: 2.00%", 1, true) ~= nil,
+        "then the gear total", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Bracers of the Set: +1%", 1, true) ~= nil,
+        "with the item the set bonus was read on", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Breastplate of Something: +1%", 1, true) ~= nil,
+        "and the plain item", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Talents: 3.00%", 1, true) ~= nil,
+        "the talents total", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Precision: +3%", 1, true) ~= nil,
+        "with the talent by name", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Buffs: 2.00%", 1, true) ~= nil,
+        "and the buffs", GLOBAL_tipText)
+check(string.find(GLOBAL_tipText, "Well Fed: +2%", 1, true) ~= nil,
+        "by name", GLOBAL_tipText)
+eq(select(1, GameTooltip:GetOwner()), GLOBAL_left.rows[GLOBAL_hitIndex].hover,
+        "anchored to the row, as ECO's own tooltip")
+
+Stub.Unhover(GLOBAL_left.rows[GLOBAL_hitIndex].hover)
+check(not GameTooltip:IsShown(), "and leaving the row puts it away")
+
+--[==[ **A row that errors says so instead of vanishing.** It used to be
+     dropped like a row the client could not answer, which is the one
+     failure a stat sheet must not hide: "hit is missing" and "hit is
+     broken" looked the same. ]==]
+GLOBAL_meleeRows = GLOBAL_sheet:StatGroup("melee").rows
+table.insert(GLOBAL_meleeRows, { "Boom", function() error("kaput") end })
+GLOBAL_sheet:SetPaneGroup("left", "melee")
+
+GLOBAL_boom = nil
+for GLOBAL_i = 1, table.getn(GLOBAL_left.drawn) do
+    if GLOBAL_left.drawn[GLOBAL_i].label == "Boom" then GLOBAL_boom = GLOBAL_i end
+end
+check(GLOBAL_boom ~= nil, "a row whose function throws is still a row")
+eq(GLOBAL_left.drawn[GLOBAL_boom].value, "n/a", "reading n/a")
+check(string.find(GLOBAL_left.drawn[GLOBAL_boom].error or "", "kaput", 1, true) ~= nil,
+        "with the error kept", tostring(GLOBAL_left.drawn[GLOBAL_boom].error))
+
+if GLOBAL_left.rows[GLOBAL_boom] then
+    Stub.Hover(GLOBAL_left.rows[GLOBAL_boom].hover)
+    GLOBAL_tipText = {}
+    for GLOBAL_i = 1, GameTooltip:NumLines() do
+        table.insert(GLOBAL_tipText, getglobal("GameTooltipTextLeft" .. GLOBAL_i):GetText())
+    end
+    GLOBAL_tipText = table.concat(GLOBAL_tipText, " | ")
+    check(string.find(GLOBAL_tipText, "kaput", 1, true) ~= nil,
+            "and the tooltip shows the error", GLOBAL_tipText)
+    Stub.Unhover(GLOBAL_left.rows[GLOBAL_boom].hover)
+end
+
+table.remove(GLOBAL_meleeRows)
+GLOBAL_sheet:SetPaneGroup("left", "base")
+
+Stub.player.buffs = {}
+Stub.tooltips["buff1"] = nil
+Stub.tooltips["buff2"] = nil
+GLOBAL_sheet:AuraBonuses(true)
+
+Stub.equipped[9] = nil
+Stub.tooltips["item9"] = nil
+Stub.tooltips["item10"] = {
+    "Gloves of Something Else",
+    "Equip: Improves your chance to hit by 1%.",
+    "Equip: Improves your chance to hit with spells by 3%.",
+    "Equip: Increases damage and healing done by magical spells and effects by up to 40.",
+    "Equip: Increases damage done by Fire spells and effects by up to 25.",
+}
+GLOBAL_sheet:GearBonuses(true)
 
 Stub.player.talents["2:3"] = nil
 Stub.player.talents["2:9"] = nil
@@ -38407,7 +39120,7 @@ eq(GLOBAL_right.drop.selectedText, "Melee", "and so does the right")
      291 down from the paper doll's top-left. ]==]
 eq(GLOBAL_left:GetWidth(), 115, "a pane is as wide as the sheet's own stat block",
         tostring(GLOBAL_left:GetWidth()))
-eq(GLOBAL_left:GetHeight(), 78, "and six rows of thirteen tall",
+eq(GLOBAL_left:GetHeight(), 85, "and the height of the client's stat art",
         tostring(GLOBAL_left:GetHeight()))
 
 GLOBAL_panePt = { GLOBAL_left:GetPoint(1) }
@@ -38426,7 +39139,14 @@ GLOBAL_row2 = { GLOBAL_left.rows[2].label:GetPoint(1) }
 eq(GLOBAL_row1[5] - GLOBAL_row2[5], 13, "rows are thirteen apart",
         tostring(GLOBAL_row1[5] - GLOBAL_row2[5]))
 
-eq(GLOBAL_row1[5], 0, "and the first is at the top of the box")
+--[==[ **Centred, twice.** The six rows are centred in the 85-pixel art
+     (three down from its top), and each row's text is centred in its own
+     thirteen -- so the first row's midline is nine below the top of the box,
+     not its top edge. "The text sits too high" was both of those at once,
+     and neither is an offset chosen by eye. ]==]
+eq(GLOBAL_row1[1], "LEFT", "a row is anchored by its midline")
+eq(GLOBAL_row1[5], -9, "nine below the top: three of slack and half a row")
+eq(select(5, GLOBAL_left.rows[1].value:GetPoint(1)), -9, "the value on the same line")
 
 --[==[ **The dropdown is above the rows, not inside a taller box.**
 
@@ -38481,6 +39201,26 @@ eq(OB.profile.modules.characterpanel.leftGroup, "melee",
         "choosing a group from the menu keeps it")
 eq(GLOBAL_left.drop.selectedText, "Melee", "and the pane redraws to match")
 
+--[==[ **The text is the client's face at the size the slider says**, rows
+     and the dropdown's label alike -- the label is the biggest text on the
+     pane and "too high" was said of the pane. Eight ships; the slider goes
+     down to six. ]==]
+GLOBAL_rowFace, GLOBAL_rowSize = GLOBAL_left.rows[1].label:GetFont()
+eq(GLOBAL_rowSize, 8, "a stat row is drawn at eight", tostring(GLOBAL_rowSize))
+eq(select(2, getglobal(GLOBAL_left.drop:GetName() .. "Text"):GetFont()), 8,
+        "and so is the dropdown's label")
+
+GLOBAL_cfg.statFontSize = 6
+GLOBAL_sheet:AfterSet("statFontSize", 6)
+eq(select(2, GLOBAL_left.rows[1].label:GetFont()), 6,
+        "the slider's floor is six and it takes at once")
+eq(select(2, GLOBAL_left.rows[1].value:GetFont()), 6, "values with the labels")
+eq(select(2, getglobal(GLOBAL_left.drop:GetName() .. "Text"):GetFont()), 6,
+        "and the dropdown's label with them")
+
+GLOBAL_cfg.statFontSize = 8
+GLOBAL_sheet:AfterSet("statFontSize", 8)
+
 GLOBAL_sheet:SetPaneGroup("left", "base")
 
 --[==[ **And the client's own blocks come back when this is off.**
@@ -38507,6 +39247,13 @@ Stub.chat = {}
 check(pcall(function() GLOBAL_sheet:DebugStats() end), "the stat debug runs")
 check(string.find(table.concat(Stub.chat, " | "), "GetCritChance", 1, true) ~= nil,
         "and says whether this client has crit")
+
+--[[ And every line the totals came from, item by item, so a wrong number is
+     settled by one screenshot rather than a round of guessing. ]]--
+check(string.find(table.concat(Stub.chat, " | "),
+        "slot 5 Breastplate of Something: hit +1", 1, true) ~= nil,
+        "the debug names the item and the line each point of hit came from",
+        table.concat(Stub.chat, " | "))
 
 Stub.SetCritApi(false)
 
