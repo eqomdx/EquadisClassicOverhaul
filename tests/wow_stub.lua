@@ -4713,6 +4713,25 @@ function SelectGossipActiveQuest(i)
     Stub.gossipPicked = { kind = "active", index = i }
 end
 
+--[[ The gossip's own things to say, answered the same flat way: title, type,
+     title, type. ]]--
+Stub.gossipOptions = {}
+
+function GetGossipOptions()
+    local out = {}
+
+    for i = 1, table.getn(Stub.gossipOptions) do
+        table.insert(out, Stub.gossipOptions[i])
+        table.insert(out, "gossip")
+    end
+
+    return unpack(out)
+end
+
+function SelectGossipOption(i)
+    Stub.gossipPicked = { kind = "option", index = i }
+end
+
 --[[ The other kind of NPC menu: no gossip text, just a list, and four different
      calls to read the same two lists with. ]]--
 function GetNumAvailableQuests() return table.getn(Stub.gossipAvailable) end

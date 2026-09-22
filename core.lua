@@ -15,7 +15,7 @@
 EquadisClassicOverhaul = {}
 local OB = EquadisClassicOverhaul
 
-OB.version = "0.99.310"
+OB.version = "0.99.312"
 OB.addonName = "Equadis' Classic Overhaul"
 
 --[[ The addon folder name is load-bearing: every media path below hardcodes it,

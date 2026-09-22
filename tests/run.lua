@@ -14361,8 +14361,11 @@ check(Stub.gossipPicked ~= nil, "with Shift, a quest is chosen")
 eq(Stub.gossipPicked.kind, "active", "the remembered one, whichever list it is in")
 eq(Stub.gossipPicked.index, 1, "by its position in that list")
 
---[[ Nothing remembered means nothing chosen, so Shift on a menu of quests you
-     have never seen still just opens the menu. ]]--
+--[==[ **Shift on a menu of quests you have never read takes the first one
+     on offer.** It used to take nothing, so Shift pushed a quest through its
+     own window and did nothing on the menu in front of it -- reported as
+     "only works when the quest is already open". New quests before turn-ins,
+     so Shift held across a menu accepts and then hands in. ]==]
 OB.quests = {}
 EquadisClassicOverhaulDB.quests = OB.quests
 Stub.gossipPicked = nil
@@ -14370,7 +14373,55 @@ Stub.gossipPicked = nil
 Stub.shiftDown = true
 qol:OnEvent()
 Stub.shiftDown = false
-eq(Stub.gossipPicked, nil, "a menu of unremembered quests is left alone")
+eq(Stub.gossipPicked and Stub.gossipPicked.kind, "available",
+        "an unremembered menu takes the first quest on offer")
+eq(Stub.gossipPicked and Stub.gossipPicked.index, 1, "the first of them")
+
+Stub.gossipAvailable = {}
+Stub.gossipPicked = nil
+Stub.shiftDown = true
+qol:OnEvent()
+Stub.shiftDown = false
+eq(Stub.gossipPicked and Stub.gossipPicked.kind, "active",
+        "and with nothing on offer, the first turn-in")
+
+--[[ A dialogue with one thing to say is a page to turn; several is a menu. ]]--
+Stub.gossipAvailable, Stub.gossipActive = {}, {}
+Stub.gossipOptions = { "Tell me more." }
+Stub.gossipPicked = nil
+Stub.shiftDown = true
+qol:OnEvent()
+Stub.shiftDown = false
+eq(Stub.gossipPicked and Stub.gossipPicked.kind, "option",
+        "with no quests and one thing to say, Shift says it")
+eq(Stub.gossipPicked and Stub.gossipPicked.index, 1, "the one")
+
+Stub.gossipOptions = { "I want to browse your goods.", "Train me." }
+Stub.gossipPicked = nil
+Stub.shiftDown = true
+qol:OnEvent()
+Stub.shiftDown = false
+eq(Stub.gossipPicked, nil, "a menu of several is left to the person")
+
+Stub.gossipOptions = { "Tell me more." }
+Stub.gossipPicked = nil
+qol:OnEvent()
+eq(Stub.gossipPicked, nil, "and without Shift nothing is said")
+
+--[[ The other kind of menu, no gossip text, behaves the same. ]]--
+Stub.gossipOptions = {}
+Stub.gossipAvailable = { "Scrap Metal" }
+Stub.gossipPicked = nil
+event = "QUEST_GREETING"
+Stub.shiftDown = true
+qol:OnEvent()
+Stub.shiftDown = false
+eq(Stub.gossipPicked and Stub.gossipPicked.kind, "available",
+        "Shift on a greeting takes the quest on offer too")
+event = "GOSSIP_SHOW"
+
+Stub.gossipAvailable = { "Scrap Metal", "Ram Riding Harnesses" }
+Stub.gossipActive = { "Kill Ten Rats" }
 
 --[[ **1.12 answers a gossip list as one flat run of title, level, title, level.**
      Pulling the titles back out of that is the part that can be got wrong, and

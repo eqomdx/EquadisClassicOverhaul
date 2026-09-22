@@ -261,6 +261,9 @@ function TurtleMail.MAIL_SHOW()
 
   m.log_tabs( m.log_enabled )
 
+  --[[ A fresh visit starts on page one -- see `hook.InboxFrame_Update`. ]]--
+  if m.api.InboxFrame then m.api.InboxFrame.pageNum = 1 end
+
   m.timer = 0
   m.money_received = 0
   m.update_money( 0 )
@@ -740,6 +743,21 @@ function TurtleMail.hook.OpenMail_Reply( ... )
 end
 
 function TurtleMail.hook.InboxFrame_Update()
+  --[==[ **A page past the end draws nothing, and the client never turns
+       back.**
+
+       `InboxFrame.pageNum` is set to one when the frame loads and never
+       again: not on a fresh visit, not when the letters on the page are
+       taken. Open everything on page two, walk away, come back with one new
+       letter -- the list draws page two of a one-page inbox, which is empty,
+       under a minimap icon that says there is mail. A reload sets the page
+       back to one, which is the whole of "it appears on reload". Clamped to
+       the last page here, before the client draws; and `MAIL_SHOW` starts
+       every visit on page one. ]==]
+  local total = math.ceil( (m.api.GetInboxNumItems() or 0) / m.api.INBOXITEMS_TO_DISPLAY )
+  if total < 1 then total = 1 end
+  if (m.api.InboxFrame.pageNum or 1) > total then m.api.InboxFrame.pageNum = total end
+
   m.orig.InboxFrame_Update()
   for i = 1, 7 do
     -- hack for tooltip update

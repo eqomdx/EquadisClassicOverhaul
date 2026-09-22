@@ -3041,14 +3041,21 @@ local function titlesFrom(list)
     return out
 end
 
---[[ **Which of an NPC's quests to pick**, in the order somebody would.
+--[==[ **Which of an NPC's quests to pick**, in the order somebody would.
 
-     A completed quest first, because that is a reward waiting. Then anything
-     remembered, available before active -- taking a repeatable is what starts
-     the loop. Then the rest, which only matters with "every quest" on.
+     Anything remembered first, available before active -- taking a repeatable
+     is what starts the loop. Then, because Shift is held and Shift means
+     "push this through", the first quest on offer and then the first one in
+     progress: accepting first, so that Shift held across a menu takes the new
+     quests and then turns the old ones in, and a turn-in that is not ready
+     stops at its own window rather than being asked for first.
+
+     It used to stop at the remembered ones, which made Shift on a menu do
+     nothing for a quest you had never read -- while Shift on that quest's own
+     window pushed it through. Reported as exactly that.
 
      Returns the kind and the index, or nothing at all, so the caller does the
-     selecting and this only decides. ]]--
+     selecting and this only decides. ]==]
 function M:BestQuest(available, active)
     for i = 1, table.getn(available) do
         if self:QuestRemembered(available[i], "accept") then
@@ -3062,28 +3069,43 @@ function M:BestQuest(available, active)
         end
     end
 
+    if table.getn(available) > 0 then return "available", 1 end
+    if table.getn(active) > 0 then return "active", 1 end
+
     return nil
 end
 
---[[ Shift on an NPC's menu takes the obvious quest.
+--[==[ **Shift on an NPC's menu takes the obvious quest**, and on a dialogue
+     with one thing to say, says it.
 
      Shift rather than automatic, and this is deliberate: a gossip menu is also
      how you reach a flight master, a bank and a trainer, and an addon that
-     jumped to a quest every time you opened one would be taking the menu away. ]]--
-function M:OnGossip(available, active, pickAvailable, pickActive)
+     jumped to a quest every time you opened one would be taking the menu away.
+
+     `options` is the gossip's own list of things to say. One of them is a
+     "continue" -- the quest-chain dialogue that goes on for three pages --
+     and Shift turns the page. Several is a menu, and a menu is left to the
+     person holding the mouse. ]==]
+function M:OnGossip(available, active, pickAvailable, pickActive, options, pickOption)
     if not self:QuestActive() then return false end
     if not IsShiftKeyDown() then return false end
 
     local kind, index = self:BestQuest(available, active)
-    if not kind then return false end
 
     if kind == "available" then
         pickAvailable(index)
-    else
+        return true
+    elseif kind == "active" then
         pickActive(index)
+        return true
     end
 
-    return true
+    if options and pickOption and table.getn(options) == 1 then
+        pickOption(1)
+        return true
+    end
+
+    return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -3130,9 +3152,13 @@ function M:OnEvent()
     if event == "QUEST_COMPLETE" then self:OnQuestComplete() return end
 
     if event == "GOSSIP_SHOW" then
+        local options = type(GetGossipOptions) == "function"
+                and titlesFrom({ GetGossipOptions() }) or {}
+
         self:OnGossip(titlesFrom({ GetGossipAvailableQuests() }),
                 titlesFrom({ GetGossipActiveQuests() }),
-                SelectGossipAvailableQuest, SelectGossipActiveQuest)
+                SelectGossipAvailableQuest, SelectGossipActiveQuest,
+                options, SelectGossipOption)
         return
     end
 

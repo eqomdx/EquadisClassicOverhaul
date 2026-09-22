@@ -1,6 +1,6 @@
 ## Interface: 11200
 ## Title: Equadis' Classic Overhaul
-## Version: 0.99.310
+## Version: 0.99.312
 ## X-AtlasCFM-Version: 1.70
 ## Author: Equadis
 ## Notes: All-in-one interface package with bundled Atlas-CFM, AtlasLoot, and embedded pfQuest/Turtle loot data.
